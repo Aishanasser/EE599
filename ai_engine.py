@@ -2,39 +2,119 @@
 import os
 import re
 import json
+import unicodedata
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 
 load_dotenv()
 
+# ==========================================
+# 1. Configuration
+# ==========================================
 FIREWORKS_API_KEY = os.getenv("FIREWORKS_API_KEY")
 FIREWORKS_BASE_URL = "https://api.fireworks.ai/inference/v1"
-MODEL_NAME = "accounts/fireworks/models/deepseek-v4-pro"
+OPENAI_BASE_URL = "https://api.openai.com/v1"
 
-if not FIREWORKS_API_KEY:
+# The deployed model is the one the measurements selected, not the one that
+# happened to be configured first. On the Arabic advertisements it leads on
+# precision (0.83), recall (0.75) and F1 (0.791); on the English sample the
+# top three models sit within the measurement noise floor, so Arabic is what
+# decides. The figures and the argument behind them are in the evaluation.
+#
+# It replaced `deepseek-v4-pro`, the earlier default. That model had to be
+# pinned to a dated snapshot after its rolling alias began returning 404
+# ("Model not found, inaccessible, and/or not deployed") mid-project while the
+# /models endpoint still listed it: the platform stopped working with no code
+# change on our side. That episode is why a name here is never an alias when
+# the provider offers a dated build — an F1 figure is reproducible only if the
+# model behind the name cannot be swapped underneath it.
+MODEL_NAME = "gpt-5.6-terra"
+_DEFAULT_BASE_URL = OPENAI_BASE_URL
+
+# The three settings above can be overridden from the environment, which is the
+# only thing the model-comparison experiment needs in order to point the whole
+# pipeline at a different provider or a different model. Nothing else changes:
+# the prompts, the matching, the thresholds and the scoring code are identical,
+# so any difference the experiment measures is the model's and not the harness's.
+#
+#   LLM_MODEL      full model id at the provider
+#   LLM_BASE_URL   provider endpoint (OpenAI's own is https://api.openai.com/v1)
+#   LLM_API_KEY    key for that provider; falls back to FIREWORKS_API_KEY
+#
+# Defaults are unchanged, so the platform behaves exactly as before when none of
+# them is set.
+MODEL_NAME = os.getenv("LLM_MODEL", MODEL_NAME)
+_BASE_URL = os.getenv("LLM_BASE_URL", _DEFAULT_BASE_URL)
+
+# The key follows the endpoint unless one is named explicitly. Without this the
+# two settings drift apart silently: pointing LLM_BASE_URL at OpenAI while the
+# key still resolved to FIREWORKS_API_KEY produced a 401 that reads like a bad
+# key rather than a mismatched pair.
+def _key_for(base_url: str) -> str:
+    if os.getenv("LLM_API_KEY"):
+        return os.getenv("LLM_API_KEY")
+    if "openai.com" in base_url:
+        return os.getenv("OPENAI_API_KEY") or ""
+    return FIREWORKS_API_KEY or ""
+
+_API_KEY = _key_for(_BASE_URL)
+
+# JSON mode is not universally supported: smaller and older models reject
+# response_format outright. The extraction prompts already state "return only
+# JSON", and _strip_code_fences handles a fenced reply, so the flag is an
+# optimisation rather than a requirement — and one that has to be switchable
+# for the comparison to be able to include models that lack it.
+_JSON_MODE = os.getenv("LLM_JSON_MODE", "1") != "0"
+
+# OpenAI's reasoning models refuse function tools on /v1/chat/completions:
+#
+#   "Function tools with reasoning_effort are not supported for gpt-5.6-terra
+#    in /v1/chat/completions. To use function tools, use /v1/responses or set
+#    reasoning_effort to 'none'."
+#
+# Both escapes were measured to work. Setting reasoning_effort to 'none' is the
+# smaller change but buys tool calling by switching the reasoning off — and the
+# agent exists precisely to reason about an answer before deciding. The
+# Responses API keeps the reasoning and the tools, so that is the one used. It
+# is on by default because the deployed model is served by OpenAI; set
+# LLM_RESPONSES_API=0 when pointing the pipeline at a provider that does not
+# serve that endpoint, such as Fireworks.
+_RESPONSES_API = os.getenv("LLM_RESPONSES_API", "1") == "1"
+
+if not _API_KEY:
     raise RuntimeError(
-        "FIREWORKS_API_KEY environment variable is not set. "
-        "Add it to your .env file or export it before running."
+        "No LLM API key found. Set OPENAI_API_KEY (or LLM_API_KEY) "
+        "in your .env file or export it before running."
     )
 
 client = ChatOpenAI(
     model=MODEL_NAME,
-    api_key=FIREWORKS_API_KEY,
-    base_url=FIREWORKS_BASE_URL,
-    temperature=0.0,
+    api_key=_API_KEY,
+    base_url=_BASE_URL,
+    temperature=0.0,  # deterministic: extraction task, not creative generation
     max_tokens=16384,
-    model_kwargs={"response_format": {"type": "json_object"}},
+    model_kwargs={"response_format": {"type": "json_object"}} if _JSON_MODE else {},
 )
 
+# A second client for the interview agent. It is identical except that it does
+# NOT force a JSON-object response, because forced JSON mode and tool calling
+# are mutually exclusive: JSON mode requires the reply to be a JSON document,
+# while tool calling requires it to be a tool_calls payload. Binding tools to
+# the JSON-mode client fails with "not strict. Only strict function tools can
+# be auto-parsed".
 agent_client = ChatOpenAI(
     model=MODEL_NAME,
-    api_key=FIREWORKS_API_KEY,
-    base_url=FIREWORKS_BASE_URL,
+    api_key=_API_KEY,
+    base_url=_BASE_URL,
     temperature=0.0,
     max_tokens=16384,
+    **({"use_responses_api": True} if _RESPONSES_API else {}),
 )
 
+# ==========================================
+# 2. System Prompt — Phase 1 (CV Skill Extraction)
+# ==========================================
 CV_SKILL_EXTRACTION_PROMPT = """You are an expert AI system for resume skill extraction.
 
 Your task is to analyze the provided CV and identify all skills mentioned.
@@ -58,6 +138,24 @@ Rules:
 1. Extract only skills — concrete named tools, technologies, programming
    languages, frameworks, methodologies, techniques, or competencies. Not
    general job duties, responsibilities, or achievements described in prose.
+1b. Inside a narrative sentence, decide by grammar, not by whether the
+   phrase sounds like a skill. From a sentence describing what the candidate
+   did, extract ONLY a proper name: a tool, technology, language, framework
+   or platform that has a name of its own (Odoo, React.js, Firebase,
+   Flutter, Next.js). A common noun phrase in such a sentence describes the
+   work and is NOT extracted, however established the practice it names may
+   be. In "Optimized legacy systems... through code refactoring, module
+   customization, and database optimization", nothing is extracted: all
+   three are common noun phrases naming the work performed. In "Launched 6+
+   websites using React.js and Firebase", React.js and Firebase are
+   extracted and nothing else is. A comma-separated list inside a narrative
+   sentence is not a skills list.
+1c. A heading that introduces a list labels the items beneath it and is not
+   a skill, and neither is any part of it. From "AI & Machine Learning:
+   Computer Vision, TensorFlow, PyTorch" extract Computer Vision, TensorFlow
+   and PyTorch — never "AI" or "Machine Learning". The same applies to
+   "Programming Languages:", "Web & Mobile Development:", "Cloud, Databases,
+   Tools & Systems:" and "Methodologies & Soft Skills:".
 2. Keep multi-word skills together. If a longer skill phrase contains a shorter
    skill inside it (e.g., "Microsoft SQL Server" contains "SQL Server" and "SQL"),
    extract only the longest/complete form — do not also list the shorter
@@ -69,8 +167,15 @@ Rules:
    rule 7 (e.g., if the CV says "Arabic (Native)" or "English — Advanced (C1)",
    extract that full string, not just "Arabic" or "English" alone).
 5. Ignore names, companies, universities, projects, and job titles.
+   Also ignore the degree, the major and the field of study: a line such as
+   "Computer Science (Artificial Intelligence)" under a university names the
+   qualification the candidate holds, not a skill they claim. A technology
+   named inside a course or project title is extracted only if it is a
+   concrete named technology (e.g. "Flutter" in a project description).
 6. Remove duplicates.
-7. Preserve the original wording exactly as it appears in the text. Never
+7. Preserve the original wording exactly as it appears in the text. This
+   concerns the skill's own words, not the sentence around it: when a named
+   skill sits inside a duty, take the skill and leave the duty. Never
    paraphrase, summarize, or convert a descriptive sentence into a generic
    label — extract the exact phrase as written, word for word, including any
    qualifiers (e.g., "Proven ability to work under pressure" must stay exactly
@@ -94,6 +199,9 @@ Output format:
 }
 """
 
+# ==========================================
+# 2b. System Prompt — Phase 2 (Job Description Requirement Extraction)
+# ==========================================
 JD_REQUIREMENT_EXTRACTION_PROMPT = """You are an expert AI system for extracting required
 skills from a company's Job Description (JD).
 
@@ -103,13 +211,27 @@ it asks the candidate to have — whether listed under "Requirements",
 in plain prose anywhere in the text. The text may be in English, Arabic, or a
 mix of both.
 
+A skill is a NAME, not a description of work. Job descriptions state most of
+what they want as duties — "debug issues in a full stack environment",
+"translate data into findings for stakeholders" — and each of those sentences
+contains a skill without being one. Extract the name the sentence rests on
+(debugging, full stack, data analysis), never the sentence itself. Scanning
+the Responsibilities section does NOT mean every responsibility becomes an
+entry.
+
 Rules:
 
 1. Extract only skills — concrete named tools, technologies, programming
    languages, frameworks, methodologies, techniques, or competencies. Not
    generic phrases like "team player mindset" unless they name an actual
    competency (e.g., "communication skills" is fine; "fast-paced
-   environment" is not a skill).
+   environment" is not a skill). Not duties, responsibilities or tasks
+   described in prose, however specific they sound.
+1b. A bare common word is not a skill when it would fit any job in any field —
+   "research", "maintenance", "development", "design", "support", "analysis"
+   on their own say nothing about what the candidate must be able to do. Keep
+   such a word only when the text qualifies it into something nameable
+   ("market research", "predictive maintenance", "circuit design").
 2. Keep multi-word skills together. If a longer skill phrase contains a shorter
    skill inside it (e.g., "Microsoft SQL Server" contains "SQL Server" and "SQL"),
    extract only the longest/complete form — do not also list the shorter
@@ -121,10 +243,13 @@ Rules:
    "Fluent in English" -> "Fluent in English", not just "English").
 5. Ignore the company name, job title, location, salary, and benefits.
 6. Remove duplicates.
-7. Preserve the original wording exactly as it appears in the text — do not
-   paraphrase or generalize a requirement into a shorter label. The only
-   exception is a trailing sentence-ending punctuation mark, which must be
-   dropped.
+7. Preserve the original wording of the SKILL exactly as it appears in the
+   text — do not paraphrase or generalize a named skill into a different
+   label ("Microsoft SQL Server" stays "Microsoft SQL Server", never "SQL").
+   This is about the skill's own words, not about the sentence around it:
+   when a skill sits inside a duty, take the skill and leave the duty. The
+   only other exception is a trailing sentence-ending punctuation mark,
+   which must be dropped.
 8. Treat "required" and "nice to have"/"preferred" skills the same way —
    extract both into the same lists (no separate priority tier).
 9. Return only JSON — no preamble, no explanation, no markdown code fences.
@@ -138,23 +263,58 @@ Output format:
 }
 """
 
-def _call_llm(system_prompt: str, user_prompt: str) -> str:
-    response = client.invoke([
+# ==========================================
+# 3. LLM call wrapper (swap this when moving providers)
+# ==========================================
+# DeepSeek v4 Pro is a reasoning model: it spends completion tokens thinking
+# before it writes a single character of the answer, and that thinking is
+# billed against the same max_tokens budget as the answer itself. Extraction
+# normally costs about 1,300 reasoning tokens, but a job description padded
+# with benefits, equal-opportunity boilerplate and application instructions has
+# been observed to make it deliberate until all 16,384 tokens were gone and
+# emit no content at all. The call then fails inside the OpenAI client with a
+# raw CompletionUsage dump, which is what the user sees.
+#
+# reasoning_effort="low" does not help — measured on this model, reasoning went
+# up (1,375 tokens) rather than down (1,310). What does help is room: the
+# model's context window is 1,048,576 tokens, so the 16,384 ceiling is ours,
+# not the model's, and a truncated call can simply be retried with more of it.
+_RETRY_MAX_TOKENS = 49_152
+_TRUNCATION_MARKER = "length limit was reached"
+
+
+def _call_llm(system_prompt: str, user_prompt: str,
+              max_tokens: int | None = None) -> str:
+    target = client if max_tokens is None else client.bind(max_tokens=max_tokens)
+    response = target.invoke([
         SystemMessage(content=system_prompt),
         HumanMessage(content=user_prompt),
     ])
     return response.content
 
 
+# ==========================================
+# 4. Helpers: JSON cleanup & schema validation
+# ==========================================
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE | re.MULTILINE)
 
 
+# Some reasoning models (Gemma 4 on Google's endpoint) write their reasoning
+# inline as <thought>...</thought> before the answer, and that endpoint offers
+# no way to switch it off. Removing the block leaves the JSON that follows it.
+# This only runs after a plain json.loads has already failed, so a model that
+# returns clean JSON never reaches it and its results are unaffected.
+_THOUGHT_RE = re.compile(r"(?s)<thought>.*?</thought>")
+
+
 def _strip_code_fences(raw_output: str) -> str:
+    raw_output = _THOUGHT_RE.sub("", raw_output)
     return _FENCE_RE.sub("", raw_output.strip()).strip()
 
 
 def _validate_schema(parsed: dict) -> str | None:
-    """Return an error message if the parsed JSON doesn't match the expected skill-extraction schema, or None if it's"""
+    """Return an error message if the parsed JSON doesn't match the expected
+    skill-extraction schema, or None if it's valid."""
     if not isinstance(parsed, dict):
         return "Top-level JSON must be an object."
     for key in ("technical_skills", "soft_skills", "languages"):
@@ -167,11 +327,29 @@ def _validate_schema(parsed: dict) -> str | None:
 
 
 def _call_llm_json(system_prompt: str, user_prompt: str) -> dict:
-    """Call the LLM and parse its response as JSON (stripping code fences if needed)."""
+    """Call the LLM and parse its response as JSON (stripping code fences if
+    needed). Returns {"error": ...} on any failure, otherwise the parsed dict.
+    Shared by every prompt in this module — schema validation is the caller's
+    responsibility, since each phase has a different expected shape."""
     try:
         raw_output = _call_llm(system_prompt, user_prompt)
     except Exception as e:
-        return {"error": f"LLM call failed: {str(e)}"}
+        if _TRUNCATION_MARKER not in str(e):
+            return {"error": f"LLM call failed: {str(e)}"}
+        # Ran out of budget while still thinking. Give it three times the room
+        # once before giving up; the failure is intermittent, not deterministic.
+        try:
+            raw_output = _call_llm(system_prompt, user_prompt,
+                                   max_tokens=_RETRY_MAX_TOKENS)
+        except Exception as retry_error:
+            if _TRUNCATION_MARKER in str(retry_error):
+                return {"error": "The model spent its whole budget reasoning "
+                                 "and never wrote an answer, twice in a row. "
+                                 "Please try again — and if it keeps failing, "
+                                 "trim the text to the responsibilities and "
+                                 "requirements, since benefits and application "
+                                 "instructions are what set this off."}
+            return {"error": f"LLM call failed: {str(retry_error)}"}
 
     try:
         return json.loads(raw_output)
@@ -183,8 +361,12 @@ def _call_llm_json(system_prompt: str, user_prompt: str) -> dict:
             return {"error": "Model did not return valid JSON.", "raw_output": raw_output}
 
 
+# ==========================================
+# 5. Public functions: extract_skills (Phase 1) / extract_jd_requirements (Phase 2)
+# ==========================================
 def _run_extraction(system_prompt: str, user_prompt: str) -> dict:
-    """Shared LLM-call + JSON-parse + schema-validation pipeline used by both extract_skills() and extract_jd_require"""
+    """Shared LLM-call + JSON-parse + schema-validation pipeline used by both
+    extract_skills() and extract_jd_requirements()."""
     parsed = _call_llm_json(system_prompt, user_prompt)
     if "error" in parsed:
         return parsed
@@ -196,26 +378,345 @@ def _run_extraction(system_prompt: str, user_prompt: str) -> dict:
     return parsed
 
 
+# ==========================================
+# 5b. Text normalisation (Arabic ingestion)
+# ==========================================
+# Arabic PDFs do not store the letters you see. They store *presentation
+# forms* — the contextual glyph variants a font uses to join letters — from
+# the Unicode blocks U+FB50-FDFF and U+FE70-FEFF. `pypdf` returns those
+# codepoints verbatim, so the text looks correct on screen but is a different
+# string entirely: the seen in "اسم" comes back as U+FEB3, not U+0633.
+#
+# This was previously recorded as `pypdf` garbling Arabic and was the stated
+# reason an Arabic CV could not be added to the F1 gold set. Measured on two
+# real Arabic CVs, the text is not garbled at all — word order is correct, and
+# NFKC normalisation converts every presentation form back to its base letter
+# (1391 forms -> 0 on the larger CV). What NFKC leaves behind is a handful of
+# Persian-range letters that fonts substitute for Arabic ones, mapped below.
+#
+# Normalising here rather than in the scoring layer matters: exact-match gold
+# annotation, entity counting and skill matching all compare strings, and all
+# three break silently if two spellings of the same letter reach them.
+_PRESENTATION_FORMS = re.compile(r"[ﭐ-﷿ﹰ-﻿]")
+
+# Font substitutions that NFKC does not undo, because these are legitimately
+# distinct codepoints in Persian/Urdu — they are simply the wrong letter here.
+_ARABIC_LETTER_FIXES = str.maketrans({
+    "ی": "ي",   # U+06CC Farsi yeh      -> Arabic yeh
+    "ک": "ك",   # U+06A9 Keheh          -> Arabic kaf
+    "ھ": "ه",   # U+06BE Heh doachashmee-> Arabic heh
+    "ە": "ه",   # U+06D5 Ae             -> Arabic heh
+})
+
+# Tatweel is decoration that stretches a joining line; harakat are optional
+# vowel marks. Both are invisible to meaning and fatal to string matching.
+_ARABIC_DECORATION = re.compile(r"[ـً-ْٰۖ-ۭ]")
+
+
+def normalize_text(text: str) -> str:
+    """Make text safe to compare, without changing what it says.
+
+    Applied at ingestion so every later stage — extraction, gap analysis,
+    entity counting, gold-set matching — sees one spelling of each letter.
+    Latin text is unaffected beyond NFKC's own ligature folding (fi -> fi).
+
+    Note this is the conservative pass: it does NOT fold hamza forms
+    (أ/إ/آ -> ا) or ta marbuta, because those change the spelling of a word
+    rather than its encoding. Aggressive folding belongs in the matching
+    layer, not here.
+    """
+    if not text:
+        return text
+    text = unicodedata.normalize("NFKC", text)
+    text = text.translate(_ARABIC_LETTER_FIXES)
+    return _ARABIC_DECORATION.sub("", text)
+
+
+# A CV written in Arabic must produce an Arabic interview. Detection is done
+# once, here, and the answer is threaded through every later stage rather than
+# re-guessed — so the questions, the evaluation and the feedback cannot end up
+# disagreeing about what language the candidate is being interviewed in.
+#
+# Counted rather than modelled: no library, no API call, no failure mode. The
+# ratio is taken over *letters only*, because a CV is full of technology names,
+# emails and dates in Latin script even when it is written in Arabic — counting
+# every character would misread an Arabic CV as an English one.
+_ARABIC_RANGE = re.compile(r"[؀-ۿ]")
+_LETTER = re.compile(r"[^\W\d_]", re.UNICODE)
+
+# Chosen low on purpose. An Arabic CV that lists its skills in English can
+# easily be only a third Arabic by letter count, while an English CV is
+# essentially 0% Arabic — so the two populations are nowhere near this line.
+_ARABIC_LANGUAGE_THRESHOLD = 0.20
+
+
+def detect_language(text: str) -> str:
+    """Return "ar" or "en" for a document. Defaults to "en" on empty input."""
+    if not text:
+        return "en"
+    letters = _LETTER.findall(text)
+    if not letters:
+        return "en"
+    arabic = sum(1 for c in letters if _ARABIC_RANGE.match(c))
+    return "ar" if arabic / len(letters) >= _ARABIC_LANGUAGE_THRESHOLD else "en"
+
+
 def extract_skills(document_text: str, document_type: str = "CV") -> dict:
-    """Phase 1: Extract the skills a candidate has, from their CV text."""
+    """
+    Phase 1: Extract the skills a candidate has, from their CV text.
+
+    Args:
+        document_text: raw CV text content (already extracted from PDF, plain text, etc.)
+        document_type: kept for backward compatibility; this function always
+            uses the CV-specific prompt (CV_SKILL_EXTRACTION_PROMPT).
+
+    Returns:
+        dict matching the schema in CV_SKILL_EXTRACTION_PROMPT, or an
+        error dict if parsing/calling the LLM fails.
+    """
     if not document_text or not document_text.strip():
         return {"error": "Empty document_text provided."}
 
-    user_prompt = f"Text:\n{document_text}"
+    user_prompt = f"Text:\n{normalize_text(document_text)}"
     return _run_extraction(CV_SKILL_EXTRACTION_PROMPT, user_prompt)
 
 
 def extract_jd_requirements(jd_text: str) -> dict:
-    """Phase 2: Extract the skills a Job Description requires from the candidate."""
+    """
+    Phase 2: Extract the skills a Job Description requires from the candidate.
+
+    Args:
+        jd_text: raw Job Description text.
+
+    Returns:
+        dict matching the schema in JD_REQUIREMENT_EXTRACTION_PROMPT, or an
+        error dict if parsing/calling the LLM fails.
+    """
     if not jd_text or not jd_text.strip():
         return {"error": "Empty jd_text provided."}
 
-    user_prompt = f"Text:\n{jd_text}"
+    user_prompt = f"Text:\n{normalize_text(jd_text)}"
     return _run_extraction(JD_REQUIREMENT_EXTRACTION_PROMPT, user_prompt)
 
 
+# ==========================================
+# 6. Phase 2 helper: CV vs Job Description skill-gap
+# ==========================================
 _SEMANTIC_MODEL = None
 _GAP_SIMILARITY_THRESHOLD = 0.6
+
+# Cosine similarity answers "are these two phrases alike?" — but the question a
+# skill gap actually asks is "does this tool count as that requirement?", and
+# the two come apart. Measured on the current model:
+#
+#     Cloud experience        <-> AWS          0.48   should match, does not
+#     container orchestration <-> Kubernetes   0.42   should match, does not
+#     Python                  <-> Java         0.45   should NOT match
+#
+# The wrong pair scores higher than two right ones, so no single threshold
+# separates them. Four models were tried — including retrieval-trained and
+# larger ones — and none separated the classes; the deepest was the worst
+# (gap -0.23 against -0.19). The limitation is the kind of relation, not the
+# capacity of the model, so a bigger model does not fix it.
+#
+# Hence two tracks. Similarity still decides everything it decides reliably —
+# a near-identical phrase above _GAP_CLEAR_MATCH, an unrelated one below
+# _GAP_CLEAR_MISS — and only the band between them is referred to the language
+# model, batched into a single call per interview.
+#
+# This does not reintroduce self-preference bias. That bias appears when the
+# model grades its OWN output; here it is asked a fact about the world (is AWS
+# a kind of cloud), with nothing of its own at stake.
+# Both bounds were calibrated, not chosen. 20 real job-ad x CV pairs (SkillSpan
+# ads x Resume-Corpus CVs, 266 requirements) were rendered in all four language
+# combinations -- English/English, Arabic/Arabic and both mixed directions --
+# by translating each side, and every requirement was labelled covered or not
+# by the language model (the same judge that settles the grey band).
+#
+# The highest score any UNCOVERED requirement reached was 0.90 ("agile
+# architecture" <-> "Agile Methodology"): similarity rises for related skills,
+# not only for equal ones. At 0.75, 2 to 7 requirements per combination were
+# declared covered that were not -- the costlier error, since it removes a real
+# gap from the interview. Above 0.92 there were none in any combination.
+#
+# The lowest score any COVERED requirement reached was 0.35 on that set, and
+# 0.12 on a smaller probe ("إكسل" <-> "Microsoft Excel": the same tool in
+# two scripts). 0.10 sits below both.
+#
+# With these bounds the embeddings settle only near-identical phrases (2-5 in
+# 100 requirements) and everything else reaches the model in the single
+# batched call per category that already existed, so the number of model calls
+# does not grow -- only the length of that one call.
+_GAP_CLEAR_MATCH = 0.92
+_GAP_CLEAR_MISS = 0.10
+
+
+NL = chr(10)
+
+# How much of the CV reaches the coverage call. Long enough for the header,
+# the experience block and the education block, which is where a job title, an
+# employer and a field of study sit; short enough that one gap call does not
+# cost more than the extraction that produced its input.
+_GAP_EVIDENCE_CHARS = 6000
+
+GAP_COVERAGE_PROMPT = """You decide whether a candidate already covers a
+required skill, given the skills their CV lists.
+
+A requirement counts as COVERED when a skill the candidate has is that
+requirement, or is a specific instance of it:
+
+  "Cloud experience"        is covered by AWS, Azure or GCP
+  "container orchestration" is covered by Kubernetes
+  "version control"         is covered by Git
+  "relational database"     is covered by PostgreSQL or MySQL
+
+A requirement is NOT covered merely because the candidate has something in the
+same field. Two different tools are two different skills:
+
+  "Kubernetes" is NOT covered by Docker
+  "Python"     is NOT covered by Java
+  "Redis"      is NOT covered by PostgreSQL
+
+When the CV source text is given, read it as evidence too. The skill list
+is a summary and drops things that are not skills but do evidence one: a job
+title, an employer, a field of study, a membership. A reservoir engineer at an
+oil company who studied petroleum engineering covers "petroleum industry" even
+when those words appear nowhere in the skill list. Judge the requirement, not
+the list.
+
+Judge each requirement independently. When genuinely unsure, answer "missing" —
+asking a candidate about a skill they have wastes one question, while assuming
+a skill they lack leaves a real gap untested.
+
+Return only JSON, no preamble:
+
+{
+  "covered": ["requirement", ...],
+  "missing": ["requirement", ...]
+}
+
+Every requirement given to you must appear in exactly one of the two lists,
+copied verbatim.
+"""
+
+
+def _resolve_grey_skills(grey: list, candidate_skills: list,
+                         cv_text: str = "") -> tuple:
+    """Ask the model which of `grey` the candidate already covers.
+
+    The model is given the candidate's full skill list, not a shortlist ranked
+    by embedding similarity. Ranking was implemented and measured, and it loses
+    the answer: for the requirement "cloud experience" the similarity model
+    ranks Nginx (0.344), REST APIs (0.339) and even photography (0.260) above
+    AWS (0.210, tenth), because it compares wording and does not know that AWS
+    is a cloud provider. A shortlist long enough to contain AWS is half the CV,
+    which is not a shortlist. Retrieval by similarity therefore fails on the
+    same relation that coverage depends on, and the full list is sent instead.
+
+    Returns (covered, missing). On any failure returns ([], grey) — treating an
+    unresolved requirement as missing, which is the conservative side: the
+    candidate gets asked about something they may already know, rather than a
+    genuine gap going untested.
+    """
+    user_prompt = (
+        "Skills the candidate has:" + NL
+        + json.dumps(candidate_skills, ensure_ascii=False) + NL + NL
+    )
+    if cv_text and cv_text.strip():
+        # Truncated rather than summarised: a summary would drop exactly the
+        # incidental lines — a job title, an employer — that this call exists
+        # to see.
+        user_prompt += ("CV source text:" + NL
+                        + cv_text.strip()[:_GAP_EVIDENCE_CHARS] + NL + NL)
+    user_prompt += ("Requirements to judge:" + NL
+                    + json.dumps(grey, ensure_ascii=False))
+    parsed = _call_llm_json(GAP_COVERAGE_PROMPT, user_prompt)
+    if "error" in parsed:
+        return [], list(grey)
+    covered = parsed.get("covered")
+    if not isinstance(covered, list):
+        return [], list(grey)
+    covered_set = {str(c).strip().lower() for c in covered}
+    keep = [g for g in grey if g.strip().lower() in covered_set]
+    return keep, [g for g in grey if g not in keep]
+
+# Languages are extracted with their proficiency wording attached, because the
+# candidate should see "Fluent in written and spoken English" rather than a
+# bare "English". But that wording is noise when MATCHING: a JD asking for
+# "Fluent in written and spoken English" scores only 0.54 against a CV that
+# lists "English" — below the 0.6 gate — so the system would report that the
+# candidate does not speak English at all. Stripping the proficiency words on
+# both sides before comparing fixes the match without touching what is shown.
+#
+# This is the same principle as normalize_text(): the conservative form is
+# stored, and aggressive folding happens in the matching layer where it belongs.
+_PROFICIENCY_WORDS = re.compile(
+    r"\b(?:fluent(?:ly)?|fluency|native|bilingual|mother\s+tongue|proficien\w*|"
+    r"advanced|intermediate|beginner|basic|elementary|conversational|working|"
+    r"professional|excellent|very|good|level|command|skills?|knowledge|"
+    r"spoken|written|writing|reading|speaking|understanding|"
+    # Level wording seen in real CVs that the first list missed: a CV saying
+    # "English ( Upper Intermediate)" against a JD asking for "English
+    # language" left "English Upper" and "English language", and neither
+    # contains the other, so the candidate was reported as not speaking
+    # English at all.
+    r"upper|lower|mid|high|low|pre|post|foundation|foundational|limited|"
+    r"full|moderate|fair|course|certificate|languages?|"
+    r"in|and|of|a|an|the)\b",
+    re.IGNORECASE)
+# Bounded on both sides by non-Arabic, so a short term cannot be cut out of
+# the middle of a longer word the way a bare alternation would.
+_AR_PROFICIENCY_TERMS = (
+    "بطلاقة", "طلاقة", "لغة الأم", "اللغة الأم", "الأم",
+    "متقدم", "متقدّم", "متوسط", "متوسّط", "مبتدئ", "ممتاز",
+    "جيد", "جيّد", "ضعيف", "محادثة", "كتابة", "قراءة",
+    "تحدث", "تحدّث", "مستوى", "إلمام", "أساسي", "لغة", "اللغة",
+    "إجادة", "إتقان", "يجيد", "تجيد",
+)
+_PROFICIENCY_WORDS_AR = re.compile(
+    "|".join(f"(?<![{_ARABIC_RANGE.pattern[1:-1]}]){re.escape(t)}"
+             f"(?![{_ARABIC_RANGE.pattern[1:-1]}])"
+             for t in _AR_PROFICIENCY_TERMS))
+
+
+# Language names are compared as strings (see compute_skill_gap), so an Arabic
+# job ad asking for "الإنجليزية" never matched a CV listing "English": the two
+# spellings share no characters. Arabic names are mapped to their English form
+# in the matching layer only; what the candidate sees is left as written.
+_AR_LANGUAGE_NAMES = {
+    "english": r"[اإ]ن[جك]ليزي[ةه]?", "arabic": r"عربي[ةه]?",
+    "french": r"فرنسي[ةه]?", "german": r"[اأ]لماني[ةه]?",
+    "spanish": r"[اإ]سباني[ةه]?", "italian": r"[اإ]يطالي[ةه]?",
+    "turkish": r"تركي[ةه]?", "russian": r"روسي[ةه]?",
+    "chinese": r"صيني[ةه]?", "japanese": r"ياباني[ةه]?",
+}
+_AR_LANGUAGE_RES = [
+    (re.compile(f"(?<![{_ARABIC_RANGE.pattern[1:-1]}])(?:ال)?{pat}"
+                f"(?![{_ARABIC_RANGE.pattern[1:-1]}])"), name)
+    for name, pat in _AR_LANGUAGE_NAMES.items()]
+
+
+def _language_core(text: str) -> str:
+    """The language name with its proficiency wording removed.
+
+    Falls back to the original string when stripping leaves nothing, so an
+    entry that is only a qualifier is compared as written rather than as "".
+    """
+    stripped = _PROFICIENCY_WORDS.sub(" ", text)
+    stripped = _PROFICIENCY_WORDS_AR.sub(" ", stripped)
+    for rx, name in _AR_LANGUAGE_RES:
+        stripped = rx.sub(f" {name} ", stripped)
+    stripped = re.sub(r"[^\w؀-ۿ]+", " ", stripped).strip()
+    return stripped or text
+
+
+def _language_words(text: str) -> set:
+    """The words of a language entry after its proficiency wording is stripped.
+
+    A set rather than a string, because matching asks whether two entries name
+    the same language, not whether one spells the other.
+    """
+    return set(_language_core(text).casefold().split())
 
 
 def _get_semantic_model():
@@ -223,12 +724,30 @@ def _get_semantic_model():
     global _SEMANTIC_MODEL
     if _SEMANTIC_MODEL is None:
         from sentence_transformers import SentenceTransformer
-        _SEMANTIC_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+        _SEMANTIC_MODEL = SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
     return _SEMANTIC_MODEL
 
 
-def compute_skill_gap(candidate_result: dict, jd_result: dict) -> dict:
-    """Compare a candidate's extracted skills (from extract_skills() on a CV) against a job description's required sk"""
+def compute_skill_gap(candidate_result: dict, jd_result: dict,
+                      cv_text: str = "") -> dict:
+    """
+    Compare a candidate's extracted skills (from extract_skills() on a CV)
+    against a job description's required skills (from extract_skills() on a
+    Job Description), and return the skills the JD asks for that the
+    candidate doesn't appear to have.
+
+    Matching is semantic (via multilingual MiniLM embeddings), not exact-string,
+    since a JD saying "Cloud experience" should count as satisfied by a CV
+    listing "AWS", and "Python" should match "python" regardless of wording —
+    unlike the exact-match methodology used for Phase 1 F1 benchmarking.
+
+    Returns:
+        {
+          "missing_technical_skills": [...],
+          "missing_soft_skills": [...],
+          "missing_languages": [...],
+        }
+    """
     model = _get_semantic_model()
     gap = {}
 
@@ -247,22 +766,138 @@ def compute_skill_gap(candidate_result: dict, jd_result: dict) -> dict:
             gap[gap_key] = list(jd_skills)
             continue
 
-        jd_embeddings = model.encode(jd_skills, convert_to_tensor=True)
-        candidate_embeddings = model.encode(candidate_skills, convert_to_tensor=True)
+        # Languages do not go through the embedding model at all. Language
+        # names are a closed vocabulary of proper nouns, and the model places
+        # them close together precisely BECAUSE they are all languages:
+        # measured, French/English = 0.64 and German/Spanish = 0.60, both above
+        # the 0.6 gate. Semantic similarity would therefore report that a
+        # candidate who speaks only English satisfies a requirement for French.
+        # Comparing the language name as a string is both correct and exact.
+        if category == "languages":
+            # Compared word by word, not by containment: what survives the
+            # stripping is the language name plus whatever qualifier the list
+            # did not catch, and two entries for the same language need only
+            # share that name. Containment fails on exactly that case —
+            # "english upper" and "english language" contain neither the other
+            # — while sharing a word is both sufficient and safe, since two
+            # different languages share none.
+            have = [_language_words(x) for x in candidate_skills]
+            gap[gap_key] = [
+                x for x in jd_skills
+                if not any(_language_words(x) & h for h in have)
+            ]
+            continue
+
+        jd_terms, candidate_terms = jd_skills, candidate_skills
+
+        jd_embeddings = model.encode(jd_terms, convert_to_tensor=True)
+        candidate_embeddings = model.encode(candidate_terms, convert_to_tensor=True)
 
         from sentence_transformers import util
         similarity_matrix = util.cos_sim(jd_embeddings, candidate_embeddings)
 
-        missing = []
+        missing, grey = [], []
         for i, jd_skill in enumerate(jd_skills):
-            best_match_score = similarity_matrix[i].max().item()
-            if best_match_score < _GAP_SIMILARITY_THRESHOLD:
-                missing.append(jd_skill)
-        gap[gap_key] = missing
+            best = similarity_matrix[i].max().item()
+            if best >= _GAP_CLEAR_MATCH:
+                continue                      # clearly covered
+            if best <= _GAP_CLEAR_MISS:
+                missing.append(jd_skill)      # clearly absent
+            else:
+                grey.append(jd_skill)         # similarity cannot tell
+
+        if grey:
+            _, still_missing = _resolve_grey_skills(grey, candidate_skills,
+                                                    cv_text)
+            missing.extend(still_missing)
+
+        # Reported in the JD order rather than code-first then model-first, so
+        # the list reads the same whichever track decided each entry.
+        gap[gap_key] = [s for s in jd_skills if s in missing]
 
     return gap
 
 
+# ==========================================
+# 6a-2. Output language
+# ==========================================
+# One instruction block per language, appended to every generating and judging
+# prompt, so the rule is stated once instead of drifting between the seven
+# prompts that produce text the candidate reads.
+#
+# The technology-name carve-out is load-bearing, not stylistic. Half the
+# Answerability Score is `content_entities`, which counts how many known skills
+# a question names by matching against the extracted skill vocabulary — and
+# that vocabulary holds "Kubernetes", not "كوبرنيتس". A translated technology
+# name scores zero, so the question fails the gate and is regenerated forever.
+# Transliterating terms would silently break the scoring layer, not just read
+# oddly.
+_LANGUAGE_DIRECTIVE = {
+    "ar": """
+LANGUAGE: Write your output in ARABIC. The candidate's CV is in Arabic, so the
+interview is conducted in Arabic.
+
+- Write questions, feedback and any free text in clear Modern Standard Arabic.
+- Keep technology, tool, framework and language names in their ORIGINAL LATIN
+  script: write Kubernetes, Python, ROS 2, FreeRTOS, SPI — never transliterate
+  them into Arabic letters. This is how engineers actually write and speak, and
+  the rest of the system matches on those exact names.
+- REQUIRED. Any OTHER skill named in the source in English — a competence, a
+  method, a domain or a soft skill, such as "Cross-functional Collaboration",
+  "problem-solving abilities" or "Reservoir Simulation" — keeps its English
+  wording and is followed IMMEDIATELY by an Arabic translation in round
+  brackets, in this exact shape:
+
+      <English name as written> (<ترجمة عربية>)
+
+  for example: "...احتجت فيه إلى Cross-functional Collaboration (التعاون بين
+  الأقسام المختلفة) مع فرق الجيولوجيا...". The line between the two cases: the
+  proper name of a product, tool or programming language (CMG, PROSPER, Petrel,
+  Python) is left alone; a phrase that describes an ability is translated. A
+  candidate who cannot read the English phrase cannot answer the question, and
+  the report then records a gap in the skill when the gap was in the wording.
+- JSON keys stay in English exactly as the schema specifies. Only the VALUES
+  are in Arabic.
+""",
+    "en": """
+LANGUAGE: Write your output in ENGLISH, even when the CV or the job
+advertisement you are reading is written in Arabic. The candidate has chosen
+an English interview.
+
+- Write questions, feedback and any free text in clear English.
+- A technology name in Latin script stays exactly as it is: Kubernetes,
+  Python, ROS 2, React.js. Add nothing to it.
+- REQUIRED. A skill named in the source in Arabic script is written in the
+  question in its Arabic form, followed IMMEDIATELY by an English translation
+  in round brackets, in this exact shape:
+
+      <الاسم كما ورد> (<translation>)
+
+  for example: "...a situation that demonstrates إدارة فرق العمل التقنية
+  (leading technical teams); what was your role...". Both halves are
+  mandatory. Never give the Arabic alone, never give the translation alone,
+  and never transliterate the name into Latin letters.
+- JSON keys stay in English exactly as the schema specifies.
+""",
+}
+
+
+def _with_language(prompt: str, language: str) -> str:
+    """Append the output-language rule to a prompt.
+
+    Both directions are stated. The English one was empty at first, on the
+    reasoning that English is the default and needs no instruction — which
+    holds only while the document itself is English. Given an Arabic CV and no
+    instruction, the model answers in the language it was reading, so a
+    candidate who selected English was interviewed in Arabic and nothing in
+    the prompt contradicted it.
+    """
+    return prompt + _LANGUAGE_DIRECTIVE.get(language, "")
+
+
+# ==========================================
+# 6b. System Prompt — Phase 2 (Strategic Question Generation)
+# ==========================================
 QUESTION_GENERATION_PROMPT = """You are an expert technical interviewer designing
 questions for a mock interview.
 
@@ -288,6 +923,21 @@ on what they already claim:
 
 If one of the two lists holds fewer distinct skills than its quota, take the
 shortfall from the other list rather than repeating a skill.
+
+HOW MANY OF EACH KIND:
+
+- **Exactly {soft_count} of the {num_questions} questions must target a SOFT /
+  behavioural skill.** The rest are technical. This quota is fixed: without it
+  the number of behavioural questions drifts with whatever the two skill lists
+  happen to contain, and one interview gets one while another gets three — so
+  the interviews are not comparable to each other.
+- Draw the soft skills from the JD and CV lists, gap ones first. If together
+  they hold fewer than {soft_count} distinct soft skills, ask about the
+  soft skills that exist and give the remainder to technical questions rather
+  than inventing a soft skill nobody mentioned.
+- Where the two splits disagree — the gap/existing split above and this one —
+  **this quota wins**, and the gap/existing balance is met as closely as the
+  remaining questions allow.
 
 TWO KINDS OF SKILL NEED TWO KINDS OF QUESTION:
 
@@ -319,6 +969,20 @@ Rules:
 2. Each question MUST explicitly name, inside its own text, the skill given
    in its "targets_skill" field. A question about RTOS that never writes
    "RTOS" is invalid.
+2b. When the skill name is written in a different script from the question,
+   write it in its own script and follow it IMMEDIATELY with a translation in
+   round brackets, in this exact shape:
+
+       <name as written> (<translation>)
+
+   Example, for an English question whose target is an Arabic skill name:
+       "How would you apply فهم دورة تطوير التطبيقات (understanding the
+        application development lifecycle) when ..."
+
+   The brackets are not optional and are not decoration: the name is what the
+   scoring layer matches on, and the translation is what makes the sentence
+   readable in the interview language. A question that gives one without the
+   other is invalid.
 3. Stay focused: one question probes one skill. Do not pad a question with
    unrelated skill names just to make it look technical.
 4. Phrase each question with a clear interrogative ("What/How/Why/Which...")
@@ -356,6 +1020,18 @@ def _validate_questions_schema(parsed: dict) -> str | None:
     return None
 
 
+# ==========================================
+# 6c. Answerability Score (AS) — computed programmatically
+# ==========================================
+# The three sub-criteria and the 0.5/0.3/0.2 weighting are defined by the
+# project author in the evaluation framework. Following the methodology of
+# Nema & Khapra (EMNLP 2018), "Towards a Better Metric for Evaluating Question
+# Generation Systems" — where answerability is derived by *counting* elements
+# of the question (named entities, question types, content words) rather than
+# by asking a language model to judge it — each sub-score below is computed
+# deterministically from the question text. Nothing here relies on the
+# generating model rating its own output, which avoids self-preference bias
+# and makes every score independently reproducible.
 _AS_WEIGHTS = {"content_entities": 0.5, "context_clarity": 0.3, "task_specificity": 0.2}
 _ANSWERABILITY_GATE = 0.7
 
@@ -372,6 +1048,10 @@ _TASK_VERBS = ("implement", "design", "debug", "optimize", "optimise", "deploy",
                "evaluate", "reduce", "improve", "extend", "connect", "trace",
                "verify", "benchmark", "tune", "prevent", "set up")
 
+# A question can ask for something concrete without using an imperative
+# technical verb — by asking for a comparison, a worked scenario, or a
+# specific past example. These phrasings count as specific too, so that
+# conceptual and behavioural questions are not unfairly penalised.
 _SPECIFICITY_PHRASES = (
     "specific example", "concrete example", "for example", "a time when",
     "a time you", "a situation where", "scenario", "difference between",
@@ -380,6 +1060,8 @@ _SPECIFICITY_PHRASES = (
     "how have you", "walk me through", "walk us through", "step by step",
 )
 
+# Filler words that appear inside skill labels ("SQL databases", "Strong
+# communication skills") and would otherwise match almost any question text.
 _TARGET_STOPWORDS = {
     "and", "or", "the", "of", "in", "with", "for", "to", "on", "at", "by",
     "using", "skills", "skill", "experience", "knowledge", "understanding",
@@ -388,17 +1070,171 @@ _TARGET_STOPWORDS = {
 }
 
 _MAX_CLEAR_QUESTION_WORDS = 60
+
+# A floor that catches degenerate output, not a judgement on good questions:
+# measured across 20 generated questions the shortest was 20 words, so neither
+# language's real output comes near it.
+#
+# The Arabic figure is scaled from the English one by the measured ratio of
+# median question length (26 / 31 = 0.85), because Arabic writes the same
+# content in fewer tokens — it attaches the article, prepositions and pronouns
+# to the word instead of separating them. Keeping one number for both would
+# hold Arabic to a stricter standard for saying the same thing.
 _MIN_DETAILED_QUESTION_WORDS = 12
+_MIN_DETAILED_QUESTION_WORDS_AR = 10
+
+# ── Arabic equivalents ────────────────────────────────────────────────────
+# Measured need: an Arabic interview generated correctly-formed questions that
+# every criterion scored near zero, because each one matched English strings.
+# The gate rejected 10 of 10. Only the vocabulary is language-specific — the
+# criteria, the 0.5/0.3/0.2 weights and the 0.7 gate are unchanged, so the two
+# languages stay on one scale and the report keeps one equation.
+_INTERROGATIVES_AR = ("ما", "ماذا", "كيف", "لماذا", "أي", "أية", "متى", "أين",
+                      "من", "هل", "كم", "بماذا", "لماذا")
+_DIRECTIVE_VERBS_AR = ("اشرح", "صف", "وضح", "وضّح", "قارن", "اذكر", "بيّن",
+                       "بين", "حلل", "حلّل", "عدد", "عدّد", "استعرض", "ناقش",
+                       "افترض", "تخيل", "تخيّل")
+# Three forms are listed for each action, because Arabic marks person and tense
+# with prefixes as well as suffixes and an English stem+suffix search finds
+# none of them. Measured: every question in a real Arabic run scored
+# task_specificity = 0.0 while asking a perfectly concrete task.
+#   - imperative / present : نفّذ، تنفذ، تتعامل   (س is handled as a prefix)
+#   - first-person past    : قمت، عملت، استخدمت   ("how did you...")
+#   - verbal noun (masdar) : إعداد، تحليل، تنظيم  — in Arabic the masdar is how
+#     a task is normally named at all ("إعداد بيئة تطوير" = "setting up a dev
+#     environment"), so omitting it misses the most common phrasing.
+_TASK_VERBS_AR = (
+    # imperative / present
+    "نفذ", "نفّذ", "صمم", "صمّم", "برمج", "اكتب", "طور", "طوّر", "حسّن", "حسن",
+    "عالج", "شخص", "شخّص", "اختبر", "ادمج", "اضبط", "هيئ", "هيّئ", "أنشئ",
+    "انشئ", "ابن", "تعامل", "حدد", "حدّد", "راقب", "تحقق", "تحقّق", "اختر",
+    "أدر", "ادر", "طبق", "طبّق", "استخدم", "تستخدم", "تقوم", "تعالج",
+    "تتعامل", "تحل", "تصمم", "تكتب", "تنفذ", "تختار", "تضبط", "تدير",
+    "تشخص", "تختبر", "تراقب", "تدمج", "تبدأ", "تتطلب", "تكتشف", "تصلح",
+    # first-person / second-person past
+    "قمت", "عملت", "استخدمت", "صممت", "نفذت", "طورت", "حللت", "اخترت",
+    "بنيت", "كتبت", "عالجت", "تعاملت", "واجهت", "أدرت", "ادرت", "اختبرت",
+    "ضبطت", "حددت", "أنشأت", "انشأت", "دمجت", "حسنت", "شخصت",
+    # verbal nouns
+    "إعداد", "اعداد", "تحليل", "تنظيم", "تشخيص", "تصميم", "تنفيذ", "معالجة",
+    "اختبار", "ضبط", "بناء", "تطوير", "دمج", "مراقبة", "تحسين", "كتابة",
+    "اختيار", "استخدام", "تصحيح", "استرجاع", "تخزين", "برمجة", "أتمتة",
+    "اتمتة", "نشر", "توثيق", "تكامل", "قياس",
+)
+
+# Behavioural questions in Arabic ask for the same four STAR components; only
+# the wording changes. The Situation anchor stays mandatory for the same
+# reason: "ماذا لو" invites a hypothetical, and a hypothetical is an opinion.
+_STAR_CUES_AR = {
+    "situation": ("موقف", "موقفا", "موقفاً", "حادثة", "مرة", "عندما",
+                  "حين", "في إحدى", "مثال محدد", "مثالا محددا", "مثالاً محدداً",
+                  "تجربة مررت", "سبق أن", "سبق لك"),
+    "task": ("دورك", "مسؤوليتك", "مهمتك", "كنت مسؤول", "كنت مسؤولا",
+             "كنت مسؤولاً", "المطلوب منك", "ما كان دورك"),
+    "action": ("ماذا فعلت", "ما الذي فعلت", "ما الخطوات", "كيف تصرفت",
+               "كيف تعاملت", "كيف عالجت", "ما الإجراءات", "الإجراءات التي",
+               "ماذا قمت", "كيف قمت", "ما الذي قمت", "ماذا عملت",
+               "كيف نفذت", "كيف حللت", "الخطوات التي اتخذت"),
+    "result": ("النتيجة", "ماذا حدث", "كيف انتهى", "ما الذي نتج", "الأثر",
+               "في النهاية", "ماذا تعلمت"),
+}
+
+_SPECIFICITY_PHRASES_AR = (
+    "مثال محدد", "مثالا محددا", "مثالاً محدداً", "على سبيل المثال", "مثال عملي",
+    "الفرق بين", "الاختلاف بين", "مقارنة بين", "قارن بين", "سيناريو",
+    "ما الخطوات", "ما هي الخطوات", "كيف تقوم", "كيف تتعامل", "كيف تعالج",
+    "خطوة بخطوة", "متى تختار", "أيهما تختار", "في أي حالة",
+)
+
+# Hesitation markers in spoken Arabic. "يعني" is included because it is the
+# dominant filler in Libyan and Levantine speech, exactly parallel to "you
+# know" in the English list.
+_FILLER_PATTERNS_AR = ("يعني", "امم", "اممم", "آه", "اه", "ااه", "مممم",
+                       "شن نقول", "كيف نقول", "بصراحة يعني")
+
+_TARGET_STOPWORDS_AR = {
+    "و", "أو", "او", "في", "من", "على", "إلى", "الى", "مع", "عن", "ال",
+    "مهارات", "مهارة", "خبرة", "معرفة", "إلمام", "المام", "قوية", "ممتازة",
+    "جيدة", "أساسية", "اساسية", "متقدمة", "القدرة", "قدرة", "إتقان", "اتقان",
+    "استخدام", "نظام", "أنظمة", "انظمة", "لغة", "إدارة", "ادارة",
+}
+
+# One lookup keyed by language, so a scorer reads its vocabulary instead of
+# closing over module-level English tuples.
+#
+# Built on first use rather than at import: the English STAR cues and filler
+# patterns are defined further down the file, next to the code that motivates
+# them, and moving them up here purely to satisfy definition order would put
+# them far from their explanation.
+_LEXICON = None
+
+
+def _build_lexicon() -> dict:
+    return {
+        "en": {
+            "interrogatives": _INTERROGATIVES,
+            "directive_verbs": _DIRECTIVE_VERBS,
+            "task_verbs": _TASK_VERBS,
+            "specificity_phrases": _SPECIFICITY_PHRASES,
+            "star_cues": _STAR_CUES,
+            "fillers": _FILLER_PATTERNS,
+            "target_stopwords": _TARGET_STOPWORDS,
+            "question_marks": ("?",),
+            "min_detailed_words": _MIN_DETAILED_QUESTION_WORDS,
+        },
+        "ar": {
+            "interrogatives": _INTERROGATIVES_AR,
+            "directive_verbs": _DIRECTIVE_VERBS_AR,
+            "task_verbs": _TASK_VERBS_AR,
+            "specificity_phrases": _SPECIFICITY_PHRASES_AR,
+            "star_cues": _STAR_CUES_AR,
+            "fillers": _FILLER_PATTERNS_AR,
+            "target_stopwords": _TARGET_STOPWORDS_AR,
+            # Arabic uses U+061F. A question ending in the wrong glyph scored
+            # as if it were not a question at all.
+            "question_marks": ("؟", "?"),
+            "min_detailed_words": _MIN_DETAILED_QUESTION_WORDS_AR,
+        },
+    }
+
+
+def _lex(language: str, key: str):
+    global _LEXICON
+    if _LEXICON is None:
+        _LEXICON = _build_lexicon()
+    return _LEXICON.get(language, _LEXICON["en"])[key]
+
+
+# Arabic attaches its conjunctions, prepositions, the future marker and the
+# definite article directly to the word (وبالبرمجة = و + بـ + ال + برمجة،
+# ستتعامل = سـ + تتعامل), so a strict boundary match finds nothing while a
+# plain substring match finds far too much. These are the single-letter
+# clitics that may precede a word.
+_AR_PREFIXES = "وفبكلس"
+_ARABIC_CHAR = r"؀-ۿ"
 
 
 def _word_boundary_search(needle: str, haystack_lower: str):
-    """Search for `needle` as a standalone token, so that e.g."""
-    pattern = r"(?<![a-z0-9])" + re.escape(needle) + r"(?![a-z0-9])"
+    """Search for `needle` as a standalone token, so that e.g. "SQL" does not
+    match inside "MySQL" and "C" does not match inside "Cortex".
+
+    For Arabic needles the left boundary also allows the attached clitics
+    (و، ف، ب، ك، ل) and the definite article, since Arabic writes them joined
+    to the following word rather than separated by a space.
+    """
+    escaped = re.escape(needle)
+    if re.search(f"[{_ARABIC_CHAR}]", needle):
+        pattern = (f"(?<![{_ARABIC_CHAR}])[{_AR_PREFIXES}]?(?:ال)?"
+                   + escaped + f"(?![{_ARABIC_CHAR}])")
+    else:
+        pattern = r"(?<![a-z0-9])" + escaped + r"(?![a-z0-9])"
     return re.search(pattern, haystack_lower)
 
 
 def _verb_search(verb: str, haystack_lower: str):
-    """Match a task verb including its common inflections, so that "deploy" also matches "deployed"/"deploying" and"""
+    """Match a task verb including its common inflections, so that "deploy"
+    also matches "deployed"/"deploying" and "optimize" also matches
+    "optimizing" (a trailing silent -e is dropped before the suffix)."""
     stem = verb[:-1] if verb.endswith("e") else verb
     pattern = r"(?<![a-z0-9])" + re.escape(stem) + r"(?:e|es|ed|ing|s)?(?![a-z0-9])"
     return re.search(pattern, haystack_lower)
@@ -414,64 +1250,106 @@ def _build_skill_vocabulary(jd_result: dict, cv_result: dict) -> set:
     return vocab
 
 
-def _count_named_entities(question_text: str, vocabulary: set) -> int:
-    """Count DISTINCT known skills named in the question."""
+def _matched_terms(question_text: str, vocabulary: set) -> set:
+    """Which DISTINCT known skills the text names. Matching runs longest-first
+    and masks each match, so a short skill nested inside a longer one ("SQL"
+    inside "SQL databases") is not returned twice."""
     text = question_text.lower()
-    count = 0
+    found = set()
     for skill in sorted(vocabulary, key=len, reverse=True):
         match = _word_boundary_search(skill.lower(), text)
         if match:
-            count += 1
+            found.add(skill)
             text = text[:match.start()] + " " * (match.end() - match.start()) + text[match.end():]
-    return count
+    return found
 
 
-def _target_is_named(question_text: str, targets_skill: str) -> bool:
-    """Does the question actually name the skill it claims to target?"""
+def _count_named_entities(question_text: str, vocabulary: set) -> int:
+    """How many DISTINCT known skills the text names."""
+    return len(_matched_terms(question_text, vocabulary))
+
+
+def _target_is_named(question_text: str, targets_skill: str,
+                     language: str = "en") -> bool:
+    """Does the question actually name the skill it claims to target?
+
+    Checked in two passes, because a question normally names one natural
+    variant of a label rather than the label verbatim:
+      1. the full label and its parts around separators — "ROS / ROS 2",
+         "C/C++", "FPGA (VHDL)";
+      2. the individual significant words — a question saying "SQL query"
+         does name the skill "SQL databases". Filler words are excluded so
+         that a label like "Modeling and Simulation" can't match on "and".
+    """
     text = question_text.lower()
 
-    candidates = [targets_skill] + re.split(r"[/,()]", targets_skill)
+    # The dot is a separator here as well as the slash and comma. Without it a
+    # target of "React.js" is searched for as one literal token and never
+    # matches an answer that says "React", which cost four substantive answers
+    # (126-476 words each) a score of zero on a real interview.
+    candidates = [targets_skill] + re.split(r"[/,().]", targets_skill)
     for candidate in candidates:
         candidate = candidate.strip().lower()
         if candidate and _word_boundary_search(candidate, text):
             return True
 
-    for word in re.split(r"[\s/,()]+", targets_skill.lower()):
+    # An Arabic label carries Arabic filler ("مهارات", "خبرة في") as well as
+    # English, and a mixed label like "إدارة قواعد بيانات SQL" contains both.
+    stopwords = set(_TARGET_STOPWORDS) | set(_lex(language, "target_stopwords"))
+    for word in re.split(r"[\s/,().\-]+", targets_skill.lower()):
         word = word.strip()
-        if len(word) >= 3 and word not in _TARGET_STOPWORDS and _word_boundary_search(word, text):
+        if len(word) >= 3 and word not in stopwords and _word_boundary_search(word, text):
             return True
     return False
 
 
-def _score_content_entities(question_text: str, targets_skill: str, vocabulary: set) -> float:
-    if not _target_is_named(question_text, targets_skill):
+def _score_content_entities(question_text: str, targets_skill: str, vocabulary: set,
+                            language: str = "en") -> float:
+    # A question that never names its own target skill is genuinely broken.
+    if not _target_is_named(question_text, targets_skill, language):
         return 0.0
+    # Naming the target earns the base score; additional distinct entities add
+    # a small bonus. The base is deliberately generous so that a well-focused
+    # single-skill question is not punished for staying focused.
     extra_entities = max(0, _count_named_entities(question_text, vocabulary) - 1)
     return min(1.0, 0.6 + 0.2 * extra_entities)
 
 
-def _score_context_clarity(question_text: str) -> float:
+def _score_context_clarity(question_text: str, language: str = "en") -> float:
     text = question_text.lower()
     score = 0.4
-    if any(_word_boundary_search(w, text) for w in _INTERROGATIVES) or \
-       any(v in text for v in _DIRECTIVE_VERBS):
+    if any(_word_boundary_search(w, text) for w in _lex(language, "interrogatives")) or \
+       any(v in text for v in _lex(language, "directive_verbs")):
         score += 0.3
-    if question_text.strip().endswith("?"):
+    if question_text.strip().endswith(_lex(language, "question_marks")):
         score += 0.3
     if len(question_text.split()) > _MAX_CLEAR_QUESTION_WORDS:
-        score -= 0.3
+        score -= 0.3  # run-on questions are harder to parse in a spoken interview
     return max(0.0, min(1.0, score))
 
 
-def _score_task_specificity(question_text: str) -> float:
+def _score_task_specificity(question_text: str, language: str = "en") -> float:
     text = question_text.lower()
-    has_task_verb = any(_verb_search(v, text) for v in _TASK_VERBS)
-    has_specific_ask = any(p in text for p in _SPECIFICITY_PHRASES)
+    if language == "ar":
+        # Arabic verbs inflect by prefix, not by suffix, so the English
+        # stem+suffix search would miss every one of them. The lexicon lists
+        # the inflected forms an interviewer actually writes instead.
+        has_task_verb = any(_word_boundary_search(v, text)
+                            for v in _lex(language, "task_verbs"))
+    else:
+        has_task_verb = any(_verb_search(v, text) for v in _lex(language, "task_verbs"))
+    has_specific_ask = any(p in text for p in _lex(language, "specificity_phrases"))
     if not has_task_verb and not has_specific_ask:
-        return 0.0
-    return 1.0 if len(question_text.split()) >= _MIN_DETAILED_QUESTION_WORDS else 0.5
+        return 0.0  # no concrete task asked — "Tell me about X"
+    return 1.0 if len(question_text.split()) >= _lex(language, "min_detailed_words") else 0.5
 
 
+# STAR (Situation, Task, Action, Result) is the standard behavioural-interview
+# framework in HR practice. It is used here as the *grounding* for soft-skill
+# questions, exactly as the computed skill gap grounds the technical ones: a
+# behavioural question is not invented freely, it is built to elicit the four
+# STAR components. Each cue list below is the wording an interviewer uses to
+# request that component.
 _STAR_CUES = {
     "situation": ("a time when", "a time you", "a situation where",
                   "a situation in which", "an occasion when", "an instance where",
@@ -483,6 +1361,11 @@ _STAR_CUES = {
     "action": ("what did you do", "what you did", "what steps", "how did you handle",
                "how did you approach", "how did you respond", "how did you deal",
                "what actions", "actions you took", "you personally do"),
+    # Matched on the verb phrase rather than the whole sentence, because the
+    # pronoun changes with context: an interviewer opening a topic says "how
+    # did IT turn out", following one up says "how did THAT turn out". A cue
+    # list tied to one pronoun silently rejects the other — which it did, on
+    # a correctly-formed follow-up, during testing.
     "result": ("outcome", "result", "what happened", "turn out", "turned out",
                "end up", "ended up", "how did it end", "how did that end",
                "impact", "in the end", "what came of"),
@@ -490,15 +1373,32 @@ _STAR_CUES = {
 
 
 def _score_star_elicitation(question_text: str,
-                            situation_established: bool = False) -> float:
-    """For a behavioural question this plays the role entity-counting plays for a technical one: it measures whether"""
+                            situation_established: bool = False,
+                            language: str = "en") -> float:
+    """For a behavioural question this plays the role entity-counting plays for
+    a technical one: it measures whether the question supplies the frame the
+    candidate needs in order to give usable evidence.
+
+    An OPENING question is scored as the fraction of the four STAR components
+    it asks for, with the Situation anchor MANDATORY — a behavioural question
+    not tied to one specific past episode is a hypothetical, and a hypothetical
+    answer is an opinion rather than evidence of past behaviour.
+
+    A FOLLOW-UP (`situation_established=True`) is scored differently, because
+    the episode already exists in the exchange that preceded it. Requiring it
+    to re-establish the Situation would reject the natural interviewer move
+    ("and how did that turn out?"), and scoring it out of four would reject any
+    follow-up for the crime of asking about one thing at a time. What it must
+    do instead is request at least one concrete STAR component.
+    """
     text = question_text.lower()
-    present = {c: any(cue in text for cue in cues) for c, cues in _STAR_CUES.items()}
+    cue_sets = _lex(language, "star_cues")
+    present = {c: any(cue in text for cue in cues) for c, cues in cue_sets.items()}
     if situation_established:
         return 1.0 if any(present.values()) else 0.0
     if not present["situation"]:
         return 0.0
-    return round(sum(present.values()) / len(_STAR_CUES), 3)
+    return round(sum(present.values()) / len(cue_sets), 3)
 
 
 def _collect_labels(jd_result: dict, cv_result: dict, category: str) -> list:
@@ -507,7 +1407,17 @@ def _collect_labels(jd_result: dict, cv_result: dict, category: str) -> list:
 
 
 def _best_label_overlap(target: str, labels: list) -> tuple:
-    """How strongly `target` matches any label in `labels`, as the comparable pair (exact_match, longest_matching_lab"""
+    """How strongly `target` matches any label in `labels`, as the comparable
+    pair (exact_match, longest_matching_label_length). (0, 0) = no match.
+
+    Two properties are deliberate:
+
+    * Whole-word containment, not plain substring — otherwise the extracted
+      technical skill "C" would match the soft label "Clear communication".
+    * Exactness outranks length, so an exact match on a short label ("Teamwork")
+      beats a partial overlap with a longer one. Comparing lengths alone let a
+      long technical label swallow an exact soft one.
+    """
     exact = 0
     longest = 0
     for label in labels:
@@ -522,7 +1432,22 @@ def _best_label_overlap(target: str, labels: list) -> tuple:
 
 
 def _is_soft_skill_target(targets_skill: str, jd_result: dict, cv_result: dict) -> bool:
-    """Decide whether a question's target is a behavioural skill."""
+    """Decide whether a question's target is a behavioural skill.
+
+    The classification is not a fresh judgement: extraction (Phase 1) already
+    sorted every skill into technical_skills / soft_skills, so this only has to
+    find which list the target belongs to. It matches loosely in both
+    directions, because the generating model may write "communication skills"
+    where extraction produced "Excellent communication skills".
+
+    Both lists are consulted and the STRONGER match wins, rather than returning
+    True on the first soft hit. That ordering fixed a real misclassification:
+    with a short extracted label like "Communication", one-directional matching
+    made the technical skill "Communication protocols (CAN, SPI, UART)" look
+    behavioural — and it would then have been asked about with a STAR question.
+    Comparing against the technical list too, the longer, exact technical match
+    outweighs the incidental one-word overlap.
+    """
     target = targets_skill.strip().lower()
     if not target:
         return False
@@ -533,7 +1458,9 @@ def _is_soft_skill_target(targets_skill: str, jd_result: dict, cv_result: dict) 
 
 
 def _derive_is_gap_skill(targets_skill: str, gap_skills: list) -> bool:
-    """Derive the gap flag from the *computed* skill gap rather than trusting the generating model's own claim, using"""
+    """Derive the gap flag from the *computed* skill gap rather than trusting
+    the generating model's own claim, using the same matching threshold that
+    produced the gap in the first place."""
     if not gap_skills:
         return False
     target_norm = targets_skill.strip().lower()
@@ -548,19 +1475,27 @@ def _derive_is_gap_skill(targets_skill: str, gap_skills: list) -> bool:
 
 def _compute_answerability(question_text: str, targets_skill: str, vocabulary: set,
                            is_soft_skill: bool,
-                           situation_established: bool = False) -> dict:
-    clarity = _score_context_clarity(question_text)
-    specificity = _score_task_specificity(question_text)
+                           situation_established: bool = False,
+                           language: str = "en") -> dict:
+    clarity = _score_context_clarity(question_text, language)
+    specificity = _score_task_specificity(question_text, language)
 
     if is_soft_skill:
+        # Counting named technical entities is meaningless for a behavioural
+        # question, so the heaviest criterion measures the equivalent property
+        # for THIS question type: does the question supply what the candidate
+        # needs in order to answer it — i.e. does it request a STAR episode.
+        # The weights themselves are untouched; only what fills the 0.5 slot
+        # changes with the question type.
         entities = None
-        star = _score_star_elicitation(question_text, situation_established)
+        star = _score_star_elicitation(question_text, situation_established, language)
         score = (_AS_WEIGHTS["content_entities"] * star
                  + _AS_WEIGHTS["context_clarity"] * clarity
                  + _AS_WEIGHTS["task_specificity"] * specificity)
     else:
         star = None
-        entities = _score_content_entities(question_text, targets_skill, vocabulary)
+        entities = _score_content_entities(question_text, targets_skill,
+                                           vocabulary, language)
         score = (_AS_WEIGHTS["content_entities"] * entities
                  + _AS_WEIGHTS["context_clarity"] * clarity
                  + _AS_WEIGHTS["task_specificity"] * specificity)
@@ -575,23 +1510,78 @@ def _compute_answerability(question_text: str, targets_skill: str, vocabulary: s
     }
 
 
+# A real interview probes both sides: what the candidate is missing (to test
+# awareness and transferable reasoning) and what they already claim (which is
+# where genuine depth is measured). Asking only about gaps produces an
+# interview the candidate fails entirely, yielding no signal about strengths.
 _GAP_QUESTION_RATIO = 0.6
 
+# Behavioural questions per interview. Left to the model's discretion this
+# drifted with the skill lists — one real interview got a single behavioural
+# question and another got three — which makes two candidates' reports
+# incomparable on the soft-skill axis. Fixing the count fixes that.
+#
+# Three of eight keeps the interview technical-first while still giving the
+# STAR rubric enough episodes to average over. Raising it without shortening
+# the technical half would invert the balance of the interview.
+SOFT_QUESTION_COUNT = 3
 
-def generate_questions(jd_result: dict, cv_result: dict, skill_gap: dict, num_questions: int = 10) -> dict:
-    """Phase 2: Generate strategic interview questions balanced between the candidate's skill gap and the skills they"""
+
+# Planned questions per interview, before the agent adds any follow-up.
+# It was ten. Two real candidates each answered thirteen questions once
+# follow-ups were added, and both sessions ran well over an hour; of four
+# people who registered, two never finished one. Eight leaves room for the
+# agent's probes inside MAX_TOTAL_QUESTIONS without the interview sprawling.
+PLANNED_QUESTION_COUNT = 8
+
+
+def generate_questions(jd_result: dict, cv_result: dict, skill_gap: dict,
+                       num_questions: int = PLANNED_QUESTION_COUNT,
+                       language: str = "en",
+                       soft_count: int = SOFT_QUESTION_COUNT) -> dict:
+    """
+    Phase 2: Generate strategic interview questions balanced between the
+    candidate's skill gap and the skills they already claim. The model only
+    writes the questions; every score attached to them (Answerability Score,
+    gate result, gap flag) is computed here in code, so the generator never
+    grades its own work.
+
+    Args:
+        jd_result: output of extract_jd_requirements().
+        cv_result: output of extract_skills().
+        skill_gap: output of compute_skill_gap().
+        num_questions: how many questions to generate in total. They are split
+            by _GAP_QUESTION_RATIO between gap skills and existing skills.
+
+    Returns:
+        {
+          "questions": [
+            {"question", "targets_skill", "is_gap_skill", "content_entities",
+             "context_clarity", "task_specificity", "answerability_score",
+             "passes_gate"}
+          ]
+        }
+        or {"error": ...} on failure.
+    """
     gap_count = round(num_questions * _GAP_QUESTION_RATIO)
     existing_count = num_questions - gap_count
+    # Never let the behavioural quota swallow the whole interview, however the
+    # caller sets it.
+    soft_count = max(0, min(soft_count, num_questions - 1))
 
     user_prompt = (
         f"JD required skills: {json.dumps(jd_result, ensure_ascii=False)}\n\n"
         f"Candidate skills: {json.dumps(cv_result, ensure_ascii=False)}\n\n"
         f"Skill gap (JD requires, candidate lacks): {json.dumps(skill_gap, ensure_ascii=False)}"
     )
-    system_prompt = QUESTION_GENERATION_PROMPT.format(
-        num_questions=num_questions,
-        gap_count=gap_count,
-        existing_count=existing_count,
+    system_prompt = _with_language(
+        QUESTION_GENERATION_PROMPT.format(
+            num_questions=num_questions,
+            gap_count=gap_count,
+            existing_count=existing_count,
+            soft_count=soft_count,
+        ),
+        language,
     )
 
     parsed = _call_llm_json(system_prompt, user_prompt)
@@ -611,11 +1601,20 @@ def generate_questions(jd_result: dict, cv_result: dict, skill_gap: dict, num_qu
         is_soft = _is_soft_skill_target(q["targets_skill"], jd_result, cv_result)
         q["is_soft_skill"] = is_soft
         q["is_gap_skill"] = _derive_is_gap_skill(q["targets_skill"], gap_skills)
-        q.update(_compute_answerability(q["question"], q["targets_skill"], vocabulary, is_soft))
+        q.update(_compute_answerability(q["question"], q["targets_skill"],
+                                        vocabulary, is_soft, language=language))
 
     return parsed
 
 
+# ==========================================
+# 6d. System Prompt — Phase 3 (Answer Evaluation)
+# ==========================================
+# Deliberately "blind": it does not reveal that this system also wrote the
+# question. A model asked to judge an answer to *its own* question tends to
+# reward answers phrased the way it would have phrased them. Presenting the
+# pair neutrally reduces that conformity effect — the same separation
+# principle applied to the Answerability score.
 ANSWER_EVALUATION_PROMPT = """You are a strict technical interviewer reviewing a
 candidate's answer during a job interview.
 
@@ -633,24 +1632,50 @@ For EACH criterion, first state briefly what you observed, then assign a score
 between 0.0 and 1.0:
 
 1. "technical_accuracy" — Are the claims the candidate made TRUE?
-   Judge only correctness, never how much was said.
-   1.0 = everything stated is correct (even if only one sentence was stated)
-   0.5 = mostly correct with an imprecision
-   0.0 = contains a clear technical error, or is factually wrong
-   Example: "Kubernetes manages containers and restarts them if they fail" is
-   brief but TRUE → technical_accuracy = 1.0 (and depth would be low).
+   Ask FIRST whether there is a claim to judge. An answer that asserts nothing
+   cannot be wrong, and must not collect this mark for being unfalsifiable.
+   Naming the topic, restating the question, and saying the answer "depends on
+   the situation" or "depends on the requirements" are not claims: nothing in
+   them could turn out to be false.
+   Then, and only then, judge correctness — never how much was said.
+   1.0 = a checkable claim was made and everything stated is correct
+   0.5 = a checkable claim was made and is mostly correct, with an imprecision
+   0.0 = a clear technical error, OR no checkable claim was made at all
+   Example of 1.0: "Kubernetes manages containers and restarts them if they
+   fail" is brief but TRUE → 1.0 (and depth would be low).
+   Example of 0.0: "Choosing between PID and state-space really depends on the
+   control algorithm and the trade-offs involved" → 0.0. It commits to
+   nothing, so there is nothing here that could be right.
 
-2. "relevance" — Does the answer address the question that was asked?
-   Judge only topic match, never completeness.
-   1.0 = it is about what was asked   0.5 = partly, or drifts to a near topic
-   0.0 = it is about something else entirely
-   Example: a brief answer that engages the right topic is still relevant.
+2. "relevance" — Is the answer ABOUT the subject the question asked about?
+   This is a topic test, not a completeness test. Interview questions here
+   usually ask for two or three things at once. Answering ONE of them, and
+   ignoring the rest, is still fully relevant — the missing parts are what
+   "depth" is for, and charging for them here would charge twice.
+   1.0 = it is about the subject asked about, however partially it is covered
+   0.5 = it drifts to a NEIGHBOURING subject (asked about embedded firmware,
+         answered about PLC ladder logic) — reserve 0.5 for a change of
+         subject, never for a short or partial answer
+   0.0 = it is about something else entirely, or it answers no question at all
+   Worked example: asked "how would you choose between PID and state-space,
+   and what trade-offs guide the decision", answered only "PID for simple
+   systems, state-space when there are many parameters" — the trade-offs half
+   is missing entirely, and relevance is still 1.0, because the answer is
+   about choosing between PID and state-space. Its shortfall belongs to depth.
 
-3. "depth" — How far below the surface does it go?
-   THIS is where brevity and superficiality are penalised.
-   1.0 = explains mechanisms, trade-offs, failure modes, or real experience
-   0.5 = correct but textbook-level, no mechanism explained
-   0.0 = a bare assertion with nothing behind it
+3. "depth" — How much REASONING is present behind the claim?
+   Ask only: did the candidate say WHY or HOW, at any level at all? This is
+   not a completeness scale and not a length scale — one sentence carrying a
+   real reason outranks a paragraph of restated question.
+   1.0 = trade-offs weighed, failure modes named, or real experience recounted
+   0.6 = the mechanism is explained, at textbook level
+   0.3 = a reason is given but not explained ("PID because it is easier to
+         tune") — this is the normal score for a correct, brief answer, and
+         it is NOT 0.0
+   0.0 = a bare assertion with no reason offered at all ("I would use PID"),
+         or nothing was answered
+   Do not reserve 0.0 for anything except a total absence of reasoning. If you
+   can name the reason the candidate gave, the score is at least 0.3.
 
 Do not reward confidence or polished phrasing on their own: a fluent answer
 that is factually wrong must still score 0.0 on technical_accuracy.
@@ -673,6 +1698,12 @@ Output format:
 """
 
 
+# A behavioural answer cannot be graded on factual correctness — there is no
+# right answer to "describe a time you missed a deadline". It is graded on
+# whether it supplies EVIDENCE, and STAR is the standard instrument for that.
+# So soft-skill answers get their own rubric rather than being forced through a
+# technical one, which would otherwise score every honest personal story 0.0 on
+# technical_accuracy.
 SOFT_ANSWER_EVALUATION_PROMPT = """You are an experienced interviewer reviewing a
 candidate's answer to a BEHAVIOURAL interview question.
 
@@ -735,21 +1766,36 @@ Output format:
 }}
 """
 
+# ==========================================
+# 6e. Answer evaluation — hybrid scoring
+# ==========================================
+# Same methodology as the Answerability Score: what can be counted is counted
+# in code, and only genuine linguistic/knowledge judgement is left to the
+# model. Asking a model for a single 0-100 verdict reproduces exactly the
+# self-rating failure documented in Phase 2 — scores cluster high and stop
+# discriminating.
 _ANSWER_WEIGHTS = {
-    "technical_accuracy": 0.35,
-    "relevance": 0.25,
-    "depth": 0.20,
-    "technical_density": 0.10,
-    "substance": 0.10,
+    "technical_accuracy": 0.35,   # model-judged
+    "relevance": 0.25,            # model-judged
+    "depth": 0.20,                # model-judged
+    "technical_density": 0.10,    # counted
+    "substance": 0.10,            # counted
 }
 
+# Behavioural answers are scored on a different basis. technical_accuracy is
+# dropped (there is nothing to be factually right about) and technical_density
+# is dropped (naming technologies is not what a teamwork answer is for); their
+# combined weight moves to STAR completeness, which is the actual evidence.
 _SOFT_ANSWER_WEIGHTS = {
-    "star_completeness": 0.45,
-    "relevance": 0.25,
-    "depth": 0.20,
-    "substance": 0.10,
+    "star_completeness": 0.45,    # computed here from the four model-judged parts
+    "relevance": 0.25,            # model-judged
+    "depth": 0.20,                # model-judged
+    "substance": 0.10,            # counted
 }
 
+# Situation and Action carry the evidential weight: without a real episode and
+# without the candidate's own contribution, there is nothing to assess. Task
+# and Result complete the picture but a strong answer can state them briefly.
 _STAR_COMPONENT_WEIGHTS = {
     "situation": 0.30,
     "task": 0.20,
@@ -757,21 +1803,26 @@ _STAR_COMPONENT_WEIGHTS = {
     "result": 0.20,
 }
 
-_FILLER_MAX_PENALTY = 0.10
+_FILLER_MAX_PENALTY = 0.10        # subtracted, never added
 
+# Only unambiguous hesitation markers. "like" and "actually" are deliberately
+# excluded: "this works like a load balancer" is correct English, and counting
+# it as hesitation would penalise a candidate for speaking properly.
 _FILLER_PATTERNS = (
     "um", "umm", "uh", "uhh", "erm", "hmm", "mmm",
     "you know", "i mean", "sort of", "kind of",
 )
 
-ANSWER_WEAK_THRESHOLD = 0.4
-ANSWER_STRONG_THRESHOLD = 0.8
+# Routing thresholds for the adaptive interview.
+ANSWER_WEAK_THRESHOLD = 0.4       # below → move on to a different skill
+ANSWER_STRONG_THRESHOLD = 0.8     # above → probe deeper on the same skill
 
-_SUBSTANCE_BANDS = ((10, 0.3), (30, 0.7))
+_SUBSTANCE_BANDS = ((10, 0.3), (30, 0.7))   # (< words, score); above → 1.0
 
 
 def _score_substance(answer_text: str) -> float:
-    """Is there actually an answer here?"""
+    """Is there actually an answer here? Word count catches the degenerate
+    cases ("222", "jgjjjjjgjjg") deterministically and for free."""
     words = len(answer_text.split())
     if words == 0:
         return 0.0
@@ -781,55 +1832,331 @@ def _score_substance(answer_text: str) -> float:
     return 1.0
 
 
-def _count_filler_words(answer_text: str) -> int:
+def _count_filler_words(answer_text: str, language: str = "en") -> int:
     text = answer_text.lower()
     total = 0
-    for filler in _FILLER_PATTERNS:
+    for filler in _lex(language, "fillers"):
         if " " in filler:
-            total += text.count(filler)
+            total += text.count(filler)          # multi-word marker
         else:
-            total += len(re.findall(
-                r"(?<![a-z0-9])" + re.escape(filler) + r"(?![a-z0-9])", text))
+            total += len(_word_boundary_search_all(filler, text))
     return total
 
 
-def _score_filler_penalty(answer_text: str) -> tuple[int, float]:
-    """Returns (filler_count, penalty)."""
+def _word_boundary_search_all(needle: str, haystack_lower: str) -> list:
+    """Every standalone occurrence, using the same boundary rules as
+    _word_boundary_search (which returns only the first)."""
+    escaped = re.escape(needle)
+    if re.search(f"[{_ARABIC_CHAR}]", needle):
+        pattern = (f"(?<![{_ARABIC_CHAR}])[{_AR_PREFIXES}]?(?:ال)?"
+                   + escaped + f"(?![{_ARABIC_CHAR}])")
+    else:
+        pattern = r"(?<![a-z0-9])" + escaped + r"(?![a-z0-9])"
+    return re.findall(pattern, haystack_lower)
+
+
+def _score_filler_penalty(answer_text: str, language: str = "en") -> tuple[int, float]:
+    """Returns (filler_count, penalty). The penalty scales with the *ratio* of
+    fillers to words, not the raw count — three hesitations in a long answer
+    is normal speech, three in a one-line answer is not."""
     words = len(answer_text.split())
-    count = _count_filler_words(answer_text)
+    count = _count_filler_words(answer_text, language)
     if words == 0 or count == 0:
         return count, 0.0
     ratio = count / words
+    # 10% or more of the answer being filler earns the full penalty.
     penalty = min(_FILLER_MAX_PENALTY, (ratio / 0.10) * _FILLER_MAX_PENALTY)
     return count, round(penalty, 3)
 
 
-def _score_technical_density(answer_text: str, vocabulary: set) -> float:
-    """How many known skills/technologies the answer actually names."""
-    named = _count_named_entities(answer_text, vocabulary)
-    if named == 0:
+# Words a generated interview question uses to frame itself rather than to name
+# its subject. They survive the length filter below, so they have to be listed.
+# The list is deliberately about question phrasing and holds nothing
+# field-specific — which is the point: the filter must not know in advance
+# whether the interview is about software, medicine or control systems.
+#
+# The cutoff below is five characters rather than seven. Seven was measured to
+# drop real terms of art that happen to be short: an accounting question about
+# reconciling a general ledger scored an answer naming ledger, journal entries
+# and accruals at density 0.0, because "ledger" is six letters. Lowering the
+# cutoff lets those in and lets more ordinary English in with them, which is
+# what the second half of this list is for.
+_QUESTION_FRAMING_WORDS = frozenset("""
+explain describe discuss outline consider compare contrast walk through
+specific specifically particular concrete example examples instance
+between within without through against during before after
+approach approaches method methods process processes practice practices
+decision decisions choice choices option options
+situation situations scenario scenarios challenge challenges problem problems
+encountered experienced designed implemented structured handled
+something anything everything nothing another
+different various several certain general overall
+require requires required requirement requirements
+include includes including included
+provide provides provided ensure ensures ensured
+would could should might
+your yours yourself
+excessively affects affecting characterise characterize differentiate
+governs governing quarterly monthly weekly yearly annual
+which these those there their theirs where when what whom whose
+using used uses given under while about above below
+other others another same such than then thus
+first second third final last next previous
+value values case cases step steps point points level levels
+would could should shall must need needs
+make makes made take takes taken give gives given
+work works working help helps helped
+part parts kind kinds type types form forms
+""".split())
+
+# Arabic question framing. The Latin patterns below match no Arabic at all, so
+# without this an Arabic interview extracts zero domain terms and falls back to
+# the skill labels alone — exactly the bias this function exists to remove,
+# reappearing on the Arabic side of a bilingual platform.
+_QUESTION_FRAMING_WORDS_AR = frozenset("""
+اشرح وضح صف قارن ناقش تحدث اذكر بيّن بين عدّد
+كيف لماذا متى أين ماذا هل الذي التي الذين اللذان
+عندما بينما حيث بحيث لكي حتى إذا لو كان كانت
+يمكن ينبغي يجب تستطيع تقدر تختار اختيار تفضل
+مثال أمثلة حالة حالات موقف مواقف مشكلة مشاكل
+طريقة طرق أسلوب أساليب خطوات خطوة عملية عمليات
+بعض جميع كل أي أية بعضها نفسه نفسها
+واجهت صممت نفذت تعاملت استخدمت
+الأول الثاني الثالث الأخير التالي السابق
+الحالة الحالات الأمر الأمور المرحلة المراحل الشيء الأشياء
+الوقت الأفضل الجيد الكثير القليل الجزء الأجزاء النوع الأنواع
+""".split())
+
+
+def _domain_terms_from_question(question_text: str) -> set:
+    """The technical vocabulary the SYSTEM ITSELF used when it wrote the question.
+
+    The skill vocabulary is built from extracted skill *labels*, and those come
+    from the job ad, which is written in recruiting language. Measured on a real
+    Control and Automation interview: the ad said "control algorithms", "PLCs",
+    "sensors, actuators" — and never once said PID, state-space, PWM, ADC,
+    controllability or observability. The question generator, meanwhile, wrote
+    all six into its questions, because expanding an HR-level skill into real
+    domain vocabulary is exactly what generating a technical question means.
+
+    So the system asked about PID and then scored an answer that said "PID" as
+    naming nothing technical at all. Across the stored interviews the bias is
+    measurable: mean technical_density 0.37 on Software/Backend roles against
+    0.04 on Control/RF ones — one system, nine times harsher on the domain whose
+    practitioners speak in concepts rather than in product names.
+
+    The reference set is therefore widened from the labels to the labels plus
+    the terms the question itself introduced. This is not a licence to parrot:
+    of the six terms those questions introduced the candidate used four and
+    ignored PWM, ADC and scan cycle, and only what is actually said is counted.
+    """
+    if not question_text:
+        return set()
+    terms = set()
+    # Acronyms are reliable here in a way they are not in a transcribed answer:
+    # the question is machine-written, so its capitalisation is intact.
+    terms.update(re.findall(r"\b[A-Z][A-Za-z0-9]*[A-Z0-9]\b", question_text))
+    # Hyphenated compounds are almost always terms of art — "state-space",
+    # "zero-order", "closed-loop" — and never question framing.
+    terms.update(re.findall(r"\b\w+(?:-\w+)+\b", question_text))
+    # Remaining single words that are not the question's own scaffolding.
+    for word in re.findall(r"\b[a-z]{5,}\b", question_text.lower()):
+        if word not in _QUESTION_FRAMING_WORDS:
+            terms.add(word)
+    # Arabic runs through the same rule with its own framing list. Without this
+    # branch the Latin patterns above match nothing and an Arabic interview
+    # extracts no domain vocabulary at all, so the bias this function removes on
+    # the English side survives untouched on the Arabic one.
+    for word in re.findall(r"[ء-ي]{4,}", question_text):
+        if word not in _QUESTION_FRAMING_WORDS_AR:
+            terms.add(word)
+    return {t for t in terms if len(t) >= 3}
+
+
+# Below this length an answer with no recognised term is a non-answer, not an
+# expert using vocabulary of their own, and asking the model about it would buy
+# nothing. "i dont know" is three words.
+_DENSITY_ESCALATION_MIN_WORDS = 12
+
+TERMINOLOGY_DENSITY_PROMPT = """You are reading one answer given in a technical
+job interview.
+
+List the DOMAIN-SPECIFIC technical terms the candidate used — the vocabulary a
+practitioner of this field would recognise as belonging to the field, and an
+outsider would not. Include terms of art, named methods, named components,
+quantities and units, and standard abbreviations.
+
+Do NOT include:
+  - ordinary words, however long ("important", "complicated", "requirements")
+  - words that merely repeat the question's own phrasing
+  - names of soft skills or of the job title
+
+List only terms that ACTUALLY APPEAR in the answer. Do not add terms the
+candidate should have used. If the answer contains none, return an empty list.
+
+Return only JSON — no preamble, no explanation, no markdown code fences.
+
+Output format:
+
+{{
+  "terms": ["string", "string"]
+}}
+"""
+
+
+# The count at which the density criterion reaches full marks. Measured over 35
+# real answers: the median names 3 terms, 77% name four or fewer, the richest
+# names 13. Saturating at 6 puts the median answer at the middle of the scale
+# and leaves range above it for the top fifth.
+#
+# The previous cutoff was 2, which pinned 66% of all answers at 1.0 — the same
+# disease "depth" had, inverted: a criterion that returns the same value for
+# most cases has stopped separating them. A brief but correct answer naming PID
+# and state-space and an expert answer naming SISO, anti-windup, MIMO, pole
+# placement, a Luenberger observer and a Nyquist margin both scored 1.0 here,
+# and the two answers finished on exactly the same final score of 0.830.
+_DENSITY_SATURATION = 6
+
+
+# Measured on 24 real answers of 25 words or more: the highest echo ratio any
+# of them reaches is 0.308, against 0.650 for an answer built to restate the
+# question. The gate sits between them with room on both sides. Answers under
+# _ECHO_MIN_WORDS are exempt — a short answer necessarily reuses the question's
+# nouns, and the corpus high of 0.600 is a fifteen-word answer that does
+# commit to something.
+_ECHO_MAX_RATIO = 0.50
+_ECHO_MIN_WORDS = 25
+
+
+def _content_words(text: str) -> list:
+    """The words in a text that carry subject matter, in both scripts. Framing
+    words are dropped so that "explain", "would" and "اشرح" cannot make an
+    answer look substantive."""
+    words = [w for w in re.findall(r"[a-z]{4,}", text.lower())
+             if w not in _QUESTION_FRAMING_WORDS]
+    words += [w for w in re.findall(r"[ء-ي]{3,}", text)
+              if w not in _QUESTION_FRAMING_WORDS_AR]
+    return words
+
+
+def _echo_ratio(answer_text: str, question_text: str) -> float:
+    """What share of the answer's subject words the question already supplied.
+
+    A candidate who restates the question makes no claim, so nothing in the
+    answer can be false — and "technical_accuracy" therefore hands them full
+    marks for being unfalsifiable. Measured over five runs on one such answer:
+    the model called it relevant twice and accurate three times, and the final
+    score ranged from 0.000 to 0.800 on identical input. The three criteria
+    meant to catch it are all model-judged, so none of them can be relied on.
+
+    This one is arithmetic. It asks only how much of the answer is the
+    question coming back, which is a fact about two strings and the same on
+    every run.
+    """
+    answer_words = _content_words(answer_text)
+    if not answer_words:
         return 0.0
-    if named == 1:
-        return 0.5
-    return 1.0
+    question_words = set(_content_words(question_text))
+    echoed = sum(1 for w in answer_words if w in question_words)
+    return round(echoed / len(answer_words), 3)
+
+
+def _band_term_count(named: float) -> float:
+    """Number of distinct terms named → a 0-1 score, linear up to saturation.
+
+    Both paths — the code count and the model's list — return through here, so
+    the scale is the same whichever produced the count. The count is a float
+    because an echoed term counts for half of one the candidate brought.
+    """
+    if named <= 0:
+        return 0.0
+    return round(min(1.0, named / _DENSITY_SATURATION), 3)
+
+
+def _llm_terminology_density(answer_text: str, question_text: str) -> float:
+    """Ask the model which domain terms the answer used, then count them here.
+
+    The division of labour is deliberate and matches the rest of this module:
+    the model IDENTIFIES terms, which is a language judgement it is good at,
+    and the code COUNTS and bands them, which keeps the number out of the
+    model's hands. Asking it for a 0-1 density directly would reproduce the
+    self-rating clustering documented in Phase 2.
+    """
+    parsed = _call_llm_json(
+        TERMINOLOGY_DENSITY_PROMPT,
+        f"Interview question:\n{question_text}\n\nCandidate's answer:\n{answer_text}")
+    terms = parsed.get("terms")
+    if not isinstance(terms, list):
+        return 0.0            # conservative: a failed call never invents credit
+    named = len({t.strip().lower() for t in terms
+                 if isinstance(t, str) and t.strip()
+                 and _word_boundary_search(t.strip().lower(), answer_text.lower())})
+    return _band_term_count(named)
+
+
+def _score_technical_density(answer_text: str, vocabulary: set,
+                             question_text: str = "") -> float:
+    """How many known skills/technologies the answer actually names. Reuses the
+    same counting used for question scoring, so the two stay consistent — and
+    counts against the question's own domain vocabulary as well as the extracted
+    skill labels, for the reason set out in _domain_terms_from_question.
+
+    String matching alone was measured to invert the thing it means to reward.
+    Asked to choose between PID and state-space, an answer that repeats the
+    question's own words scored 1.0, while two expert answers naming SISO,
+    MIMO, anti-windup, pole placement, a Luenberger observer, Nyquist margin,
+    minimum phase and modal decomposition both scored 0.0 — none of those terms
+    was in the question, so none was in the reference set. The parrot beat the
+    practitioner.
+
+    So a count of zero is no longer taken as an answer. It is the one case
+    string matching cannot decide, and only that case is escalated to the model
+    — a substantive answer that named nothing recognised is exactly the
+    signature of an expert using vocabulary of their own. Short answers are not
+    escalated: "i dont know" needs no second opinion, and the guard keeps the
+    added cost to the rare case that motivates it.
+
+    The count is then graded rather than banded into thirds — see
+    _DENSITY_SATURATION for why, and for what the old cutoff at two was doing.
+
+    A term the question already supplied counts for half of one the candidate
+    brought. Repeating "PID" back at a question about PID shows the candidate
+    is on the right subject and no more, while naming anti-windup unprompted is
+    evidence of knowing the field. Without the discount an answer made entirely
+    of the question's own words collected full marks on this criterion in every
+    one of five runs — the one criterion here that is deterministic was
+    deterministically wrong.
+    """
+    reference = set(vocabulary) | _domain_terms_from_question(question_text)
+    matched = _matched_terms(answer_text, reference)
+    if not matched and len(answer_text.split()) >= _DENSITY_ESCALATION_MIN_WORDS:
+        return _llm_terminology_density(answer_text, question_text)
+    question_lower = (question_text or "").lower()
+    own = sum(1 for t in matched
+              if not _word_boundary_search(t.lower(), question_lower))
+    return _band_term_count(own + 0.5 * (len(matched) - own))
 
 
 def _score_star_completeness(parsed: dict) -> float:
-    """Combine the four model-judged STAR components into one figure."""
+    """Combine the four model-judged STAR components into one figure. The model
+    reports what it observed per component; the arithmetic stays in code, for
+    the same reason the Answerability Score does — a single holistic 0-1 asked
+    of a model clusters high and stops discriminating."""
     return round(sum(_STAR_COMPONENT_WEIGHTS[c] * parsed[c]
                      for c in _STAR_COMPONENT_WEIGHTS), 3)
 
 
 def _evaluate_soft_answer(question: str, answer: str, targets_skill: str,
                           substance: float, filler_count: int,
-                          filler_penalty: float) -> dict:
+                          filler_penalty: float, language: str = "en") -> dict:
     """STAR-based evaluation for a behavioural question."""
     user_prompt = (
         f"Behavioural skill being probed: {targets_skill}\n\n"
         f"Interview question:\n{question}\n\n"
         f"Candidate's answer:\n{answer}"
     )
-    parsed = _call_llm_json(SOFT_ANSWER_EVALUATION_PROMPT, user_prompt)
+    parsed = _call_llm_json(
+        _with_language(SOFT_ANSWER_EVALUATION_PROMPT, language), user_prompt)
     if "error" in parsed:
         return parsed
 
@@ -840,43 +2167,94 @@ def _evaluate_soft_answer(question: str, answer: str, targets_skill: str,
                     "raw_output": parsed}
 
     star_completeness = _score_star_completeness(parsed)
-    score = (
-        _SOFT_ANSWER_WEIGHTS["star_completeness"] * star_completeness
-        + _SOFT_ANSWER_WEIGHTS["relevance"] * parsed["relevance"]
-        + _SOFT_ANSWER_WEIGHTS["depth"] * parsed["depth"]
-        + _SOFT_ANSWER_WEIGHTS["substance"] * substance
-    ) - filler_penalty
+    # Same rule as the technical path: an episode that does not answer the
+    # question asked is no evidence about the behaviour being probed, however
+    # well told it is. Without this, a fluent story about the wrong thing still
+    # collects the substance weight and part of the STAR score.
+    skill_untested = parsed["relevance"] == 0.0
+    if skill_untested:
+        score = 0.0
+    else:
+        score = (
+            _SOFT_ANSWER_WEIGHTS["star_completeness"] * star_completeness
+            + _SOFT_ANSWER_WEIGHTS["relevance"] * parsed["relevance"]
+            + _SOFT_ANSWER_WEIGHTS["depth"] * parsed["depth"]
+            + _SOFT_ANSWER_WEIGHTS["substance"] * substance
+        ) - filler_penalty
 
     return {
         "final_score": round(max(0.0, min(1.0, score)), 3),
         "is_soft_skill": True,
         "substance": substance,
-        "skill_addressed": None,
-        "technical_density": None,
+        "skill_untested": skill_untested,
+        "skill_addressed": None,        # not applicable — see evaluate_answer
+        "technical_density": None,      # not applicable to a behavioural answer
         "filler_count": filler_count,
         "filler_penalty": filler_penalty,
         "star": {c: parsed[c] for c in _STAR_COMPONENT_WEIGHTS},
         "star_completeness": star_completeness,
-        "technical_accuracy": None,
+        "technical_accuracy": None,     # nothing to be factually right about
         "relevance": parsed["relevance"],
         "depth": parsed["depth"],
-        "feedback": parsed.get("feedback", ""),
+        "feedback": (
+            "This answer did not address the skill being asked about, so it "
+            "carries no evidence either way — the skill was not tested."
+            if skill_untested else parsed.get("feedback", "")),
         "llm_called": True,
     }
 
 
 def evaluate_answer(question: str, answer: str, targets_skill: str,
-                    vocabulary: set, is_soft_skill: bool = False) -> dict:
-    """Phase 3: Evaluate a candidate's answer to one interview question."""
+                    vocabulary: set, is_soft_skill: bool = False,
+                    language: str = "en") -> dict:
+    """
+    Phase 3: Evaluate a candidate's answer to one interview question.
+
+    Countable properties (substance, whether the skill was addressed, technical
+    density, filler words) are computed here in code. Only technical accuracy,
+    relevance and depth are judged by the model, and it is shown the pair
+    blind — it is not told the question came from this same system.
+
+    An answer with no substance, or one that never engages the skill at all,
+    is scored zero WITHOUT calling the model: it is deterministically
+    unanswerable, the check is free, and it cannot be flattered.
+
+    Returns:
+        {"final_score", "substance", "skill_addressed", "technical_density",
+         "filler_count", "filler_penalty", "technical_accuracy", "relevance",
+         "depth", "feedback", "llm_called"}
+        or {"error": ...} on failure.
+    """
     answer = (answer or "").strip()
 
     substance = _score_substance(answer)
-    filler_count, filler_penalty = _score_filler_penalty(answer)
+    filler_count, filler_penalty = _score_filler_penalty(answer, language)
 
+    # Reported, but no longer decisive.
+    #
+    # This used to be a kill switch: an answer that did not literally contain
+    # its target skill scored 0 without the evaluator ever being called. That
+    # is a bad proxy for "engaged with the topic", and it failed on real
+    # interviews — four answers of 126 to 476 words were zeroed, including a
+    # detailed account of prioritising a mid-sprint request that simply never
+    # used the word "Agile", and a React explanation that said "React" where
+    # the skill label read "React.js".
+    #
+    # Whether an answer is on topic is a semantic judgement, and the rubric
+    # already has the right instrument for it: `relevance`, judged by the model.
+    # An off-topic answer now scores low through that path (relevance near 0
+    # drags the weighted total down) instead of being silently zeroed by a
+    # string comparison. The cost is one model call on answers that would
+    # previously have been rejected for free — correctness is worth more than
+    # that call.
     skill_addressed = (None if is_soft_skill
-                       else (_target_is_named(answer, targets_skill) if answer else False))
+                       else (_target_is_named(answer, targets_skill, language)
+                             if answer else False))
 
-    if substance == 0.0 or skill_addressed is False:
+    # --- deterministic short-circuit -------------------------------------
+    # Only the genuinely degenerate case: no answer at all. "222" or an empty
+    # box needs no model to judge it, and cannot be flattered by one.
+    if substance == 0.0:
         return {
             "final_score": 0.0,
             "is_soft_skill": is_soft_skill,
@@ -893,18 +2271,59 @@ def evaluate_answer(question: str, answer: str, targets_skill: str,
             "llm_called": False,
         }
 
+    # --- the question, handed back ----------------------------------------
+    # An answer long enough to have said something, made mostly of the words
+    # the question supplied, has said nothing. It is not caught by any of the
+    # three model-judged criteria: it asserts nothing, so "technical_accuracy"
+    # cannot fault it; it names the right subject, so "relevance" reads as
+    # high. Run five times on one such answer the final score came back 0.000,
+    # 0.000, 0.450, 0.000 and 0.800 — the protection existed but was a coin
+    # toss.
+    #
+    # The thresholds are measured, not chosen. Across 24 real answers of 25
+    # words or more the highest echo ratio is 0.308, while the constructed
+    # echo sits at 0.650 — better than double the margin. Short answers are
+    # exempt because a brief answer reuses the question's nouns by necessity:
+    # the highest echo in the whole corpus, 0.600, is a fifteen-word answer
+    # that does commit to something.
+    echo_ratio = _echo_ratio(answer, question)
+    if (echo_ratio >= _ECHO_MAX_RATIO
+            and len(answer.split()) >= _ECHO_MIN_WORDS):
+        return {
+            "final_score": 0.0,
+            "is_soft_skill": is_soft_skill,
+            "substance": substance,
+            "skill_addressed": skill_addressed,
+            "answer_is_echo": True,
+            "echo_ratio": echo_ratio,
+            "technical_density": 0.0,
+            "filler_count": filler_count,
+            "filler_penalty": 0.0,
+            "technical_accuracy": None,
+            "relevance": None,
+            "depth": None,
+            "feedback": ("This answer restates the question rather than "
+                         "answering it. Say what you would actually do, and "
+                         "why — one concrete step is worth more than a "
+                         "paragraph that names the topic again."),
+            "llm_called": False,
+        }
+
+    # --- behavioural questions take the STAR rubric ------------------------
     if is_soft_skill:
         return _evaluate_soft_answer(question, answer, targets_skill,
-                                     substance, filler_count, filler_penalty)
+                                     substance, filler_count, filler_penalty,
+                                     language)
 
-    technical_density = _score_technical_density(answer, vocabulary)
+    technical_density = _score_technical_density(answer, vocabulary, question)
 
     user_prompt = (
         f"Skill being probed: {targets_skill}\n\n"
         f"Interview question:\n{question}\n\n"
         f"Candidate's answer:\n{answer}"
     )
-    parsed = _call_llm_json(ANSWER_EVALUATION_PROMPT, user_prompt)
+    parsed = _call_llm_json(
+        _with_language(ANSWER_EVALUATION_PROMPT, language), user_prompt)
     if "error" in parsed:
         return parsed
 
@@ -913,29 +2332,67 @@ def evaluate_answer(question: str, answer: str, targets_skill: str,
             return {"error": f"Answer evaluation returned a non-numeric '{field}'.",
                     "raw_output": parsed}
 
-    score = (
-        _ANSWER_WEIGHTS["technical_accuracy"] * parsed["technical_accuracy"]
-        + _ANSWER_WEIGHTS["relevance"] * parsed["relevance"]
-        + _ANSWER_WEIGHTS["depth"] * parsed["depth"]
-        + _ANSWER_WEIGHTS["technical_density"] * technical_density
-        + _ANSWER_WEIGHTS["substance"] * substance
-    ) - filler_penalty
+    # An answer that scores zero on BOTH relevance and depth did not engage
+    # with the skill at all — typically it answered a different question well.
+    # Three of the five criteria (accuracy, density, substance) never ask what
+    # the answer is *about*, so a fluent off-topic reply still collects 0.55 of
+    # the weight: measured, an expert PostgreSQL answer to a Kubernetes question
+    # scored 0.45 and would have been filed as "adequate at Kubernetes" for a
+    # candidate who never mentioned it.
+    #
+    # The paradox is that the stronger the candidate, the worse the error: a
+    # weak off-topic answer stays under the threshold on its own, while a good
+    # one is promoted. So the score is zeroed and flagged — and the flag is the
+    # point. "Not tested" is a different fact from "does not know", exactly as
+    # a NULL final score differs from a stored 0, and the report must not turn
+    # the first into the second.
+    # Relevance alone. The first version also required depth == 0, on the
+    # assumption that an off-topic answer would be shallow — but depth measures
+    # how developed the answer is, not what it is about. Measured: an expert
+    # PostgreSQL answer to a Kubernetes question came back relevance 0.0 with
+    # depth 1.0, so the conjunction never fired and the answer was filed as
+    # "adequate at Kubernetes" at 0.65. Depth and topic are independent, and
+    # only relevance asks whether this is an answer to the question that was
+    # actually put.
+    skill_untested = parsed["relevance"] == 0.0
+    if skill_untested:
+        score = 0.0
+    else:
+        score = (
+            _ANSWER_WEIGHTS["technical_accuracy"] * parsed["technical_accuracy"]
+            + _ANSWER_WEIGHTS["relevance"] * parsed["relevance"]
+            + _ANSWER_WEIGHTS["depth"] * parsed["depth"]
+            + _ANSWER_WEIGHTS["technical_density"] * technical_density
+            + _ANSWER_WEIGHTS["substance"] * substance
+        ) - filler_penalty
 
     return {
         "final_score": round(max(0.0, min(1.0, score)), 3),
         "is_soft_skill": False,
         "substance": substance,
         "skill_addressed": True,
+        "skill_untested": skill_untested,
         "technical_density": technical_density,
         "filler_count": filler_count,
         "filler_penalty": filler_penalty,
         "technical_accuracy": parsed["technical_accuracy"],
         "relevance": parsed["relevance"],
         "depth": parsed["depth"],
-        "feedback": parsed.get("feedback", ""),
+        "feedback": (
+            "This answer did not address the skill being asked about, so it "
+            "carries no evidence either way — the skill was not tested."
+            if skill_untested else parsed.get("feedback", "")),
         "llm_called": True,
     }
 
+
+# ==========================================
+# 6f. Adaptive interview — dynamically generated questions
+# ==========================================
+# Questions produced mid-interview must clear the SAME Answerability gate as
+# the pre-planned ones. Without this the system would have two tiers: planned
+# questions quality-checked, improvised ones not — which would undermine the
+# gate's meaning entirely.
 
 FOLLOWUP_QUESTION_PROMPT = """You are a technical interviewer. The candidate just
 gave a strong answer about a skill, and you want to find the limit of what they
@@ -990,6 +2447,12 @@ Output format:
 """
 
 
+# The technical follow-up prompt above is wrong for a behavioural answer: it
+# asks for failure modes, edge cases and mechanisms, which produce nonsense
+# when the subject is a story about a disagreement in a team. This one instead
+# takes the STAR component scores that evaluation already produced and asks
+# for whatever the candidate left out — which is exactly the move a real
+# interviewer makes ("...and how did that turn out?").
 SOFT_FOLLOWUP_QUESTION_PROMPT = """You are an interviewer. The candidate has just
 described a real situation from their past, but their account is incomplete.
 
@@ -1033,6 +2496,9 @@ Output format:
 }}
 """
 
+# Off-plan behavioural questions open a NEW episode rather than continuing one,
+# so unlike the follow-up above they must still establish the Situation
+# themselves — the same requirement as a planned behavioural question.
 SOFT_OFF_PLAN_QUESTION_PROMPT = """You are an interviewer. While answering a
 different question, the candidate revealed something about the behavioural
 skill "{skill}", which was not part of the planned question set. You want to
@@ -1060,16 +2526,21 @@ Output format:
 }}
 """
 
-MAX_PROBE_DEPTH = 2
-MAX_OFF_PLAN_QUESTIONS = 2
-MAX_TOTAL_QUESTIONS = 12
-_MAX_QUESTION_GEN_RETRIES = 2
+MAX_PROBE_DEPTH = 2            # follow-ups allowed per skill
+MAX_OFF_PLAN_QUESTIONS = 2     # off-plan pivots allowed per interview
+MAX_TOTAL_QUESTIONS = 12       # hard ceiling on interview length
+_MAX_QUESTION_GEN_RETRIES = 2  # attempts to clear the gate before giving up
 
 
 def _generate_gated_question(system_prompt: str, user_prompt: str, skill: str,
                              vocabulary: set, is_soft_skill: bool,
-                             situation_established: bool = False) -> dict:
-    """Generate one question and hold it to the same Answerability gate used for the planned set."""
+                             situation_established: bool = False,
+                             language: str = "en") -> dict:
+    """Generate one question and hold it to the same Answerability gate used
+    for the planned set. Retries once on failure; the caller is expected to
+    fall back to the planned queue if this still returns None, so a weak
+    question is never shown to a candidate."""
+    system_prompt = _with_language(system_prompt, language)
     for _ in range(_MAX_QUESTION_GEN_RETRIES):
         parsed = _call_llm_json(system_prompt, user_prompt)
         if "error" in parsed:
@@ -1082,8 +2553,8 @@ def _generate_gated_question(system_prompt: str, user_prompt: str, skill: str,
         parsed["is_soft_skill"] = is_soft_skill
         parsed.update(_compute_answerability(
             question_text, parsed["targets_skill"], vocabulary, is_soft_skill,
-            situation_established))
-        parsed["is_gap_skill"] = False
+            situation_established, language))
+        parsed["is_gap_skill"] = False   # set by the caller, which knows the gap
         if parsed["passes_gate"]:
             return parsed
     return None
@@ -1091,8 +2562,15 @@ def _generate_gated_question(system_prompt: str, user_prompt: str, skill: str,
 
 def generate_followup(original_question: str, answer: str, targets_skill: str,
                       vocabulary: set, is_soft_skill: bool = False,
-                      star: dict | None = None) -> dict:
-    """Generate a deeper follow-up grounded in what the candidate actually said."""
+                      star: dict | None = None, language: str = "en") -> dict:
+    """Generate a deeper follow-up grounded in what the candidate actually
+    said. Returns None if no generated question clears the gate.
+
+    A behavioural follow-up takes a different route entirely: it is told which
+    STAR components the answer was missing and asks for the weakest one, and
+    it is scored with `situation_established=True` because the episode was
+    already established by the answer being followed up on.
+    """
     user_prompt = (
         f"Skill being probed: {targets_skill}\n\n"
         f"Question already asked:\n{original_question}\n\n"
@@ -1109,16 +2587,25 @@ def generate_followup(original_question: str, answer: str, targets_skill: str,
             result=star.get("result", 0.0),
         )
         return _generate_gated_question(system_prompt, user_prompt, targets_skill,
-                                        vocabulary, True, situation_established=True)
+                                        vocabulary, True,
+                                        situation_established=True,
+                                        language=language)
 
     return _generate_gated_question(
         FOLLOWUP_QUESTION_PROMPT.format(skill=targets_skill),
-        user_prompt, targets_skill, vocabulary, False)
+        user_prompt, targets_skill, vocabulary, False, language=language)
 
 
 def generate_off_plan_question(skill_name: str, answer_context: str,
-                               vocabulary: set, is_soft_skill: bool = False) -> dict:
-    """Generate a question about a skill the candidate raised themselves, outside the planned set."""
+                               vocabulary: set, is_soft_skill: bool = False,
+                               language: str = "en") -> dict:
+    """Generate a question about a skill the candidate raised themselves,
+    outside the planned set. Returns None if it can't clear the gate.
+
+    Unlike a follow-up, this opens a NEW episode, so a behavioural one must
+    still establish its own Situation — the same requirement as a planned
+    behavioural question.
+    """
     user_prompt = (
         f"Skill to ask about: {skill_name}\n\n"
         f"The candidate mentioned it while saying:\n{answer_context}"
@@ -1127,9 +2614,12 @@ def generate_off_plan_question(skill_name: str, answer_context: str,
               else OFF_PLAN_QUESTION_PROMPT)
     return _generate_gated_question(
         prompt.format(skill=skill_name),
-        user_prompt, skill_name, vocabulary, is_soft_skill)
+        user_prompt, skill_name, vocabulary, is_soft_skill, language=language)
 
 
+# ==========================================
+# 6g. System Prompt — the adaptive interview agent (ReAct)
+# ==========================================
 AGENT_SYSTEM_PROMPT = """You are a technical interviewer running an adaptive
 interview. After each answer you receive a numeric evaluation, and you decide
 what to do next — exactly as an experienced interviewer would.
@@ -1163,16 +2653,30 @@ get_interview_state first if you need it.
 """
 
 
+# ==========================================
+# 7. Standalone test harness
+# ==========================================
 if __name__ == "__main__":
+    # A synthetic CV, not a real one. It deliberately mixes the cases the
+    # extractor has to separate: named tools, a skill buried in a project
+    # sentence rather than a skills list, job duties described in prose (which
+    # must NOT be extracted), soft skills, and languages with proficiency
+    # qualifiers attached.
     sample_cv_text = """
-    Aisha is a final-year Electrical and Electronic Engineering student specializing
-    in Automatic Control. Experience with Arduino, ESP32, and MPU6050 sensors for
-    embedded IoT projects. Built a Smart Car Black Box System using AWS-free local
-    MySQL storage, OLED display integration, and Blynk for cloud connectivity.
-    Familiar with Python, MATLAB, and C for control systems coursework. Has worked
-    with ROS 2 (Humble) and Turtlesim for robotics simulation. Member of IEEE and
-    the Lybotics Wizards Robotics Team. Strong communication and teaching skills,
-    having taught Arduino and computer science at a school level.
+    Final-year Electrical and Electronic Engineering student, Automatic Control track.
+
+    Projects: built a data-logging system on an ESP32 with an MPU6050 sensor,
+    storing readings in MySQL and displaying live values on an OLED module.
+    Simulated a differential-drive robot in ROS 2 (Humble) using Turtlesim.
+
+    Coursework: Python, MATLAB, C, Arduino.
+
+    Experience: documented laboratory procedures, prepared weekly progress
+    reports, and coordinated with the supervising engineer on scheduling.
+
+    Personal skills: strong communication skills, teamwork, time management.
+
+    Languages: Arabic (Native), English (Intermediate).
     """
 
     print("Running Phase 1 skill extraction test...\n")

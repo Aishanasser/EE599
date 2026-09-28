@@ -1,12 +1,20 @@
+import json
+import os
 import streamlit as st
 import streamlit.components.v1 as components
 import time
 import mysql.connector
 from mysql.connector import Error
+from dotenv import load_dotenv
 import pandas as pd
+
+load_dotenv()
 from pypdf import PdfReader
-from ai_engine import extract_skills
-from graph_engine import run_cv_jd_pipeline
+from ai_engine import (extract_skills, normalize_text, detect_language,
+                       ANSWER_WEAK_THRESHOLD, ANSWER_STRONG_THRESHOLD,
+                       MAX_TOTAL_QUESTIONS)
+from graph_engine import run_cv_jd_pipeline    # LangGraph pipeline — fixed path
+from react_agent import run_answer_cycle       # ReAct agent — the model decides
 
 st.set_page_config(
     page_title="IntervAI Pro | AI Interview Platform",
@@ -30,6 +38,18 @@ if st.session_state.dark_mode:
     _gradient_text = "linear-gradient(135deg, #FFFFFF 30%, #A78BFA 100%)"
     _badge_bg = "rgba(124, 58, 237, 0.15)"
     _badge_color = "#C084FC"
+    _muted = "#9CA3AF"
+    _muted_soft = "#6B7280"
+    _hr = "rgba(255, 255, 255, 0.06)"
+    _c_violet = "#A78BFA"
+    _c_blue = "#60A5FA"
+    _c_green = "#34D399"
+    _c_cyan = "#06B6D4"
+    _c_amber = "#F59E0B"
+    _c_yellow = "#FBBF24"
+    _c_red = "#F87171"
+    _input_bg = "rgba(255, 255, 255, 0.04)"
+    _input_border = "rgba(255, 255, 255, 0.14)"
 else:
     _bg_base = "#F7F5FC"
     _bg_gradient = "radial-gradient(circle at 50% -20%, #EDE9FE, #F7F5FC 60%)"
@@ -42,6 +62,21 @@ else:
     _gradient_text = "linear-gradient(135deg, #1F2937 30%, #7C3AED 100%)"
     _badge_bg = "rgba(124, 58, 237, 0.08)"
     _badge_color = "#6D28D9"
+    # The light branch darkens every accent. The dark-theme tints (#A78BFA,
+    # #34D399 ...) sit around 2:1 contrast on a near-white page, which is
+    # below the readable floor; these variants clear 4.5:1.
+    _muted = "#4B5563"
+    _muted_soft = "#6B7280"
+    _hr = "rgba(17, 24, 39, 0.10)"
+    _c_violet = "#6D28D9"
+    _c_blue = "#1D4ED8"
+    _c_green = "#047857"
+    _c_cyan = "#0E7490"
+    _c_amber = "#B45309"
+    _c_yellow = "#B45309"
+    _c_red = "#DC2626"
+    _input_bg = "#FFFFFF"
+    _input_border = "rgba(17, 24, 39, 0.16)"
 
 # Injected custom CSS - includes a permanent fix for the sidebar toggle button disappearing
 st.markdown(f"""
@@ -56,6 +91,108 @@ st.markdown(f"""
 
     .stApp {{
         background: {_bg_gradient};
+    }}
+
+    /* === Legibility on the light theme ===
+       .streamlit/config.toml pins Streamlit's base theme to "dark", which is
+       what gives the app its look out of the box — but it also means every
+       element Streamlit renders itself (headings, labels, tab titles,
+       expander headers, widget text) is painted near-white by Streamlit's own
+       stylesheet. Setting `color` on html/body cannot reach them: those rules
+       target the elements directly and win on specificity. So when Dark Mode
+       is switched off the background flips to light and that text stays
+       white, i.e. invisible. These selectors re-colour Streamlit's elements
+       from the same variables that drive the rest of the palette. */
+    .stApp, .stApp p, .stApp li, .stApp label, .stApp small, .stApp summary,
+    .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6,
+    .stApp [data-testid="stMarkdownContainer"],
+    .stApp [data-testid="stWidgetLabel"],
+    .stApp [data-testid="stWidgetLabel"] p,
+    .stApp [data-testid="stMetricValue"],
+    .stApp [data-testid="stMetricLabel"],
+    .stApp [data-baseweb="tab"],
+    [data-testid="stSidebar"] p,
+    [data-testid="stSidebar"] label,
+    [data-testid="stSidebar"] small,
+    [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2,
+    [data-testid="stSidebar"] h3, [data-testid="stSidebar"] h4,
+    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] {{
+        color: {_text_color};
+    }}
+
+    /* Buttons keep white text: they sit on the violet gradient in both
+       themes, so the rule above must not reach the label inside them. */
+    .stApp .stButton > button, .stApp .stButton > button *,
+    .stApp .stDownloadButton > button, .stApp .stDownloadButton > button *,
+    .stApp .stFormSubmitButton > button, .stApp .stFormSubmitButton > button * {{
+        color: #FFFFFF !important;
+    }}
+
+    /* Captions stay deliberately quieter than body text. */
+    .stApp [data-testid="stCaptionContainer"],
+    .stApp [data-testid="stCaptionContainer"] p {{
+        color: {_muted} !important;
+    }}
+
+    /* Inputs carry their own surface so the answer box, the CV uploader and
+       the dropdowns stay legible on either background. */
+    .stApp textarea, .stApp input,
+    .stApp [data-baseweb="input"], .stApp [data-baseweb="textarea"],
+    .stApp [data-baseweb="base-input"], .stApp [data-baseweb="base-textarea"],
+    .stApp [data-baseweb="select"] > div,
+    .stApp [data-testid="stFileUploaderDropzone"] {{
+        background-color: {_input_bg} !important;
+        color: {_text_color} !important;
+        border-color: {_input_border} !important;
+    }}
+
+    /* The password reveal icon is a button *inside* the input, so it inherits
+       nothing from the rule above. */
+    .stApp [data-baseweb="base-input"] button {{
+        color: {_text_color} !important;
+        background: transparent !important;
+    }}
+
+    .stApp textarea::placeholder, .stApp input::placeholder {{
+        color: {_muted} !important;
+        opacity: 1;
+    }}
+
+    .stApp hr {{
+        border-color: {_hr};
+    }}
+
+    /* Streamlit's secondary buttons — the file uploader's browse control among
+       them — keep the dark base surface, so give them one that matches the
+       active theme rather than leaving dark text on a dark button. */
+    .stApp button[data-testid="stBaseButton-secondary"] {{
+        background-color: {_input_bg} !important;
+        border-color: {_input_border} !important;
+    }}
+    .stApp button[data-testid="stBaseButton-secondary"] * {{
+        color: {_text_color} !important;
+    }}
+
+    /* The uploader's hint line ("5MB per file - PDF") is a bare span that
+       Streamlit paints translucent white. */
+    .stApp [data-testid="stFileUploaderDropzoneInstructions"] span,
+    .stApp [data-testid="stFileUploaderDropzoneInstructions"] small {{
+        color: {_muted} !important;
+    }}
+
+    /* Streamlit's default link blue drops under 3:1 on the light background. */
+    .stApp a, [data-testid="stSidebar"] a {{
+        color: {_c_blue};
+    }}
+
+    /* The sidebar collapse/expand arrows. Streamlit renamed this control's
+       test id (it is no longer stSidebarCollapseButton), so the gradient rule
+       further down no longer reaches it and the icon stayed near-white —
+       invisible on the light background. */
+    .stApp button[data-testid="stBaseButton-headerNoPadding"] *,
+    .stApp button[data-testid="stExpandSidebarButton"] *,
+    [data-testid="stSidebar"] button[data-testid="stBaseButton-headerNoPadding"] * {{
+        color: {_text_color} !important;
     }}
 
     /* === 🛠️ Definitive fix for the sidebar toggle button === */
@@ -125,9 +262,21 @@ st.markdown(f"""
         border-right: 1px solid {_sidebar_border};
     }}
 
+    /* Arabic content renders right-to-left. Scoped to generated content
+       rather than the whole page: the interface chrome stays English, and
+       flipping it would misalign every label. Latin technology names inside
+       an Arabic sentence are handled by the browser's bidi algorithm — they
+       stay left-to-right on their own, which is why the prompts keep them in
+       Latin script. */
+    .rtl {{
+        direction: rtl;
+        text-align: right;
+        unicode-bidi: isolate;
+    }}
+
     .badge {{
         background: {_badge_bg};
-        color: {_badge_color};
+        color: {_badge_color} !important;
         border: 1px solid rgba(124, 58, 237, 0.3);
         padding: 4px 12px;
         border-radius: 50px;
@@ -380,15 +529,88 @@ components.html("""
 </script>
 """, height=0)
 
+# Connection details come from the environment, not from the source.
+#
+# They used to be hardcoded to localhost, which means "the machine running this
+# code". That works while the app and MySQL sit on the same laptop, and fails
+# silently everywhere else: a participant running the app on their own computer
+# resolves localhost to their machine, finds no database, and every save call
+# quietly does nothing. For a study whose whole output is the saved responses,
+# that is the worst possible failure mode.
+#
+# Defaults keep the local XAMPP setup working unchanged, so nothing breaks
+# while a shared database is being set up.
+DB_CONFIG = {
+    "host": os.getenv("DB_HOST", "localhost"),
+    "port": int(os.getenv("DB_PORT", "3306")),
+    "database": os.getenv("DB_NAME", "intervai_db"),
+    "user": os.getenv("DB_USER", "root"),
+    "password": os.getenv("DB_PASSWORD", ""),
+}
+
+# Managed providers (Aiven among them) refuse unencrypted connections, while a
+# local XAMPP install has no certificate at all. Pointing DB_SSL_CA at the
+# provider's CA file switches TLS on; leaving it unset keeps the local setup
+# working exactly as before.
+_DB_SSL_CA = os.getenv("DB_SSL_CA", "").strip()
+if _DB_SSL_CA:
+    DB_CONFIG["ssl_ca"] = _DB_SSL_CA
+    DB_CONFIG["ssl_verify_cert"] = True
+
+# Speak the MySQL protocol in Python rather than through the connector's C
+# extension. The extension is preferred automatically whenever it imports, and
+# on Windows under Python 3.14 its TLS handshake dereferences a bad pointer:
+# the interpreter dies with an access violation instead of raising, so the
+# error is unreachable from Python and the page simply disappears. The pure
+# path is a few milliseconds slower per query and immune to that.
+DB_CONFIG["use_pure"] = True
+
+# Remembered so the failure is reported once per session rather than on every
+# rerun, which in Streamlit would mean on every keystroke.
+_DB_ERROR = None
+
+
 def get_db_connection():
+    global _DB_ERROR
     try:
-        return mysql.connector.connect(host='localhost', database='intervai_db', user='root', password='')
-    except Error:
+        conn = mysql.connector.connect(connection_timeout=8, **DB_CONFIG)
+        _DB_ERROR = None
+        return conn
+    except Error as e:
+        _DB_ERROR = str(e)
         return None
 
-def init_db():
+
+@st.cache_data(ttl=30, show_spinner=False)
+def db_status() -> tuple[bool, str]:
+    """Whether the database is reachable, and why not if it isn't.
+
+    Cached for 30 seconds because Streamlit re-runs the whole script on every
+    interaction — without this, the status badge would open a fresh connection
+    to a remote server on each keystroke, and every one of those is a round
+    trip to another country.
+
+    The TTL is short on purpose: a database that drops mid-interview must show
+    as down within seconds, not stay green because the answer was cached.
+    Actual saves are never cached — they always attempt a real connection.
+    """
     conn = get_db_connection()
     if conn:
+        conn.close()
+        return True, f"{DB_CONFIG['user']}@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}"
+    return False, _DB_ERROR or "unknown error"
+
+def init_db():
+    """Create the schema if it is missing.
+
+    Wrapped because this runs at import time: an unhandled exception here
+    stops the whole app from loading, and a silent skip leaves every later
+    query failing against tables that were never created.
+    """
+    conn = get_db_connection()
+    if not conn:
+        return False
+    try:
         cursor = conn.cursor()
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
@@ -405,7 +627,7 @@ def init_db():
                 job_title VARCHAR(255) NOT NULL,
                 experience_level VARCHAR(100),
                 job_description TEXT,
-                score INT DEFAULT 0,
+                score INT DEFAULT NULL,
                 ai_evaluation TEXT,
                 session_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -417,48 +639,130 @@ def init_db():
                 interview_id INT,
                 question_text TEXT NOT NULL,
                 user_answer TEXT,
+                score FLOAT NULL,
+                evaluation_json TEXT NULL,
                 FOREIGN KEY (interview_id) REFERENCES interviews(id) ON DELETE CASCADE
             )
         ''')
+
+        # Migration for databases created before per-answer scoring existed.
+        # CREATE TABLE IF NOT EXISTS leaves an older table untouched, so the
+        # new columns have to be added explicitly; MySQL has no
+        # ADD COLUMN IF NOT EXISTS, hence the check against information_schema.
+        cursor.execute('''
+            SELECT COLUMN_NAME FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = %s AND TABLE_NAME = 'interview_qa'
+        ''', (DB_CONFIG["database"],))
+        existing = {r[0] for r in cursor.fetchall()}
+        for column, ddl in (("score", "ADD COLUMN score FLOAT NULL"),
+                            ("evaluation_json", "ADD COLUMN evaluation_json TEXT NULL")):
+            if column not in existing:
+                cursor.execute(f"ALTER TABLE interview_qa {ddl}")
+
+        # interviews.score was created as DEFAULT 0, which makes an interview
+        # that was never finished indistinguishable from one genuinely scored
+        # zero. The dashboard filters on `score is not None`, so a walked-away
+        # session was being counted as a real 0% — dragging the candidate's
+        # average down and showing "declining" on the progress panel. NULL is
+        # the only value that means "no score yet".
+        #
+        # SET DEFAULT NULL, not DROP DEFAULT. Dropping the default removes the
+        # implicit DEFAULT NULL along with the 0, and Aiven runs with
+        # STRICT_ALL_TABLES: an INSERT that omits a column with no default at
+        # all then fails outright with "Field 'score' doesn't have a default
+        # value" — even though the column is nullable. That is exactly what
+        # create_interview_session() does, so the earlier DROP DEFAULT stopped
+        # the platform from starting any new interview at all. This statement
+        # is idempotent, so it also repairs a database left in that state.
+        cursor.execute("ALTER TABLE interviews ALTER COLUMN score SET DEFAULT NULL")
+
+        # Resume support. Everything an in-progress interview needs lives in
+        # st.session_state, which is per browser session and is wiped by a
+        # logout, a refresh, or the host putting the app to sleep. The answers
+        # were already durable — each one is written as it is submitted — but
+        # the question queue and the agent's budget counters were not, so a
+        # candidate who dropped out could only start over. This column holds
+        # them as JSON, and is cleared when the interview is finalised.
+        cursor.execute("""
+            SELECT COLUMN_NAME FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = %s AND TABLE_NAME = 'interviews'
+        """, (DB_CONFIG["database"],))
+        if "resume_json" not in {r[0] for r in cursor.fetchall()}:
+            cursor.execute("ALTER TABLE interviews ADD COLUMN resume_json MEDIUMTEXT NULL")
+
         conn.commit()
-        cursor.close()
-        conn.close()
+        return True
+    except Error as e:
+        # Surfaced rather than swallowed: without the schema nothing works, and
+        # the cause (permissions, wrong database name) belongs on screen.
+        st.error(f"⚠️ Could not create the database schema: {e}")
+        return False
+    finally:
+        try:
+            cursor.close(); conn.close()
+        except Exception:
+            pass
 
 # Auto-create/repair tables on startup
 init_db()
 
 def create_user(name, email, password):
+    """Returns (ok, reason). `reason` distinguishes a duplicate email from a
+    database failure — returning a bare False for both told a user whose
+    database was down that their email was already taken, which is a
+    misleading message and sends them to fix the wrong thing."""
     conn = get_db_connection()
-    if conn:
+    if not conn:
+        return False, "unavailable"
+    try:
+        cursor = conn.cursor()
+        cursor.execute('INSERT INTO users (name, email, password) VALUES (%s, %s, %s)',
+                       (name, email, password))
+        conn.commit()
+        return True, "created"
+    except mysql.connector.IntegrityError:
+        return False, "duplicate"
+    except Error:
+        return False, "unavailable"
+    finally:
         try:
-            cursor = conn.cursor()
-            cursor.execute('INSERT INTO users (name, email, password) VALUES (%s, %s, %s)', (name, email, password))
-            conn.commit()
-            return True
-        except mysql.connector.IntegrityError:
-            return False
-        finally:
-            cursor.close()
-            conn.close()
-    return False
+            cursor.close(); conn.close()
+        except Exception:
+            pass
 
 def authenticate_user(email, password):
+    """Returns (user_id, name) on success, None on wrong credentials, and the
+    string "unavailable" when the database could not be reached.
+
+    The three cases used to collapse into a bare None, so a user whose database
+    was down was told their email or password was wrong — sending them to
+    change a password that was never the problem.
+    """
     conn = get_db_connection()
-    if conn:
+    if not conn:
+        return "unavailable"
+    try:
         cursor = conn.cursor()
-        cursor.execute('SELECT id, name FROM users WHERE email=%s AND password=%s', (email, password))
+        cursor.execute('SELECT id, name FROM users WHERE email=%s AND password=%s',
+                       (email, password))
         result = cursor.fetchone()
-        cursor.close()
-        conn.close()
-        if result: return result[0], result[1]
-    return None
+        return (result[0], result[1]) if result else None
+    except Error:
+        return "unavailable"
+    finally:
+        try:
+            cursor.close(); conn.close()
+        except Exception:
+            pass
 
 def create_interview_session(user_id, job_title, exp_level, job_desc):
     conn = get_db_connection()
     if conn:
         try:
             cursor = conn.cursor()
-            cursor.execute('INSERT INTO interviews (user_id, job_title, experience_level, job_description) VALUES (%s, %s, %s, %s)', (user_id, job_title, exp_level, job_desc))
+            # score stays NULL until the interview is finished: see the
+            # migration note in init_db().
+            cursor.execute('INSERT INTO interviews (user_id, job_title, experience_level, job_description, score) VALUES (%s, %s, %s, %s, NULL)', (user_id, job_title, exp_level, job_desc))
             conn.commit()
             return cursor.lastrowid
         except Error:
@@ -468,37 +772,319 @@ def create_interview_session(user_id, job_title, exp_level, job_desc):
             conn.close()
     return None
 
-def save_question_answer(interview_id, question_text, user_answer):
-    conn = get_db_connection()
-    if conn:
-        cursor = conn.cursor()
-        cursor.execute('INSERT INTO interview_qa (interview_id, question_text, user_answer) VALUES (%s, %s, %s)', (interview_id, question_text, user_answer))
-        conn.commit()
-        cursor.close()
-        conn.close()
+def save_question_answer(interview_id, question_text, user_answer,
+                         score=None, evaluation=None):
+    """Persist one answer together with its evaluation.
 
-def finalize_interview(interview_id, score, evaluation_text):
+    Returns True on success. The caller is expected to surface a failure:
+    this used to return nothing and skip silently when the database was
+    unreachable, so an entire interview could be conducted and lost without
+    anyone noticing.
+    """
     conn = get_db_connection()
-    if conn:
+    if not conn:
+        st.error(f"⚠️ Could not save this answer — database unreachable "
+                 f"({_DB_ERROR}). Your answers are NOT being recorded.")
+        return False
+    try:
         cursor = conn.cursor()
-        cursor.execute('UPDATE interviews SET score = %s, ai_evaluation = %s WHERE id = %s', (score, evaluation_text, interview_id))
+        payload = json.dumps(evaluation, ensure_ascii=False) if evaluation else None
+        # The same question with the same answer in the same interview is one
+        # answer, however many times it reaches here. Two real interviews
+        # stored such a pair twice — a second click on Submit while the first
+        # was still being evaluated — and the duplicate was averaged into the
+        # final score. A row whose evaluation failed (score NULL) is completed
+        # by the retry instead of being left beside it.
+        cursor.execute(
+            'SELECT id, score FROM interview_qa WHERE interview_id = %s '
+            'AND question_text = %s AND user_answer = %s ORDER BY id LIMIT 1',
+            (interview_id, question_text, user_answer))
+        existing = cursor.fetchone()
+        if existing:
+            if existing[1] is None and score is not None:
+                cursor.execute(
+                    'UPDATE interview_qa SET score = %s, evaluation_json = %s '
+                    'WHERE id = %s', (score, payload, existing[0]))
+                conn.commit()
+            return True
+        cursor.execute(
+            'INSERT INTO interview_qa '
+            '(interview_id, question_text, user_answer, score, evaluation_json) '
+            'VALUES (%s, %s, %s, %s, %s)',
+            (interview_id, question_text, user_answer, score, payload))
         conn.commit()
-        cursor.close()
-        conn.close()
+        return True
+    except Error as e:
+        st.error(f"⚠️ Could not save this answer: {e}")
+        return False
+    finally:
+        try:
+            cursor.close(); conn.close()
+        except Exception:
+            pass
+
+# Fields that together describe "where this interview had got to". Answers
+# are NOT among them — those are already rows in interview_qa — but the
+# evaluations are, because the final report averages them and re-reading them
+# out of the answer rows would mean re-parsing JSON that is already in memory.
+_RESUME_FIELDS = (
+    "interview_queue", "current_question", "interview_answers",
+    "interview_evaluations", "covered_skills", "probe_depth", "off_plan_used",
+    "generated_questions", "skill_gap", "jd_skills", "cv_skills",
+    "interview_language", "mock_questions",
+)
+
+
+def save_interview_progress(interview_id, next_index=None) -> None:
+    """Snapshot the live interview so it can be picked up later.
+
+    Best effort by design: this runs after every answer, and a failure here
+    must not cost the candidate the answer they just submitted — that is
+    already stored by save_question_answer(). So it stays silent, and the
+    worst case is the interview being non-resumable, which is where it was
+    before this existed.
+    """
+    if not interview_id:
+        return
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        snapshot = {f: st.session_state.get(f) for f in _RESUME_FIELDS}
+        # The snapshot is taken inside answer processing, and the question
+        # index is advanced after it returns — so without this the snapshot
+        # always named the question just answered, and every resumed interview
+        # asked it again.
+        if next_index is not None:
+            snapshot["current_question"] = next_index
+        payload = json.dumps(snapshot, ensure_ascii=False, default=str)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE interviews SET resume_json = %s WHERE id = %s",
+                       (payload, interview_id))
+        conn.commit()
+    except (Error, TypeError, ValueError):
+        pass
+    finally:
+        try:
+            cursor.close(); conn.close()
+        except Exception:
+            pass
+
+
+def load_unfinished_interview(user_id):
+    """Newest interview for this user that was never finished and has a
+    snapshot. Returns (row, state) or (None, None)."""
+    conn = get_db_connection()
+    if not conn:
+        return None, None
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT id, job_title, session_date, resume_json FROM interviews "
+            "WHERE user_id = %s AND score IS NULL AND resume_json IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1", (user_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None, None
+        return row, json.loads(row["resume_json"])
+    except (Error, ValueError, TypeError):
+        return None, None
+    finally:
+        try:
+            cursor.close(); conn.close()
+        except Exception:
+            pass
+
+
+def finalize_interview(interview_id, evaluation_text):
+    """Average the stored answer rows into the interview's final score.
+
+    Returns the score written (0-100), or None if nothing was written.
+
+    This had neither an error branch nor a try block: if the database was
+    unreachable the update was skipped in silence, so the candidate saw a score
+    on screen while the stored row kept its default of 0. For a study whose
+    only output is the stored rows, a score that exists on screen and nowhere
+    else is worse than no score at all.
+
+    The score is now computed HERE, from interview_qa, instead of being passed
+    in from st.session_state. The caller used to average a list held in browser
+    session state and fall back to `0` when that list was empty — so a session
+    whose state had been cleared (a refresh, the host sleeping the app) wrote a
+    confident 0 over an interview whose answers were all sitting in the
+    database, correctly scored. One real candidate was recorded at 0% with a
+    true average of 58%. The answer rows are the durable record; averaging them
+    cannot disagree with them, and when there is nothing to average the column
+    is left NULL, which is the only value that means "not scored".
+    """
+    conn = get_db_connection()
+    if not conn:
+        st.error("⚠️ Could not save your final score — database unreachable "
+                 f"({_DB_ERROR}).")
+        return None
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT AVG(score) FROM interview_qa '
+            'WHERE interview_id = %s AND score IS NOT NULL', (interview_id,))
+        row = cursor.fetchone()
+        if not row or row[0] is None:
+            st.warning("⚠️ No scored answers were found for this interview, so "
+                       "no final score was recorded.")
+            return None
+        score = round(100 * float(row[0]))
+        # resume_json is cleared here: a finished interview must not show up
+        # as resumable on the next login.
+        cursor.execute(
+            'UPDATE interviews SET score = %s, ai_evaluation = %s, '
+            'resume_json = NULL WHERE id = %s',
+            (score, evaluation_text, interview_id))
+        conn.commit()
+        if cursor.rowcount == 0:
+            # The update ran but matched nothing — a wrong or deleted id.
+            st.warning(f"⚠️ No interview row #{interview_id} was updated.")
+            return None
+        return score
+    except Error as e:
+        st.error(f"⚠️ Could not save your final score: {e}")
+        return None
+    finally:
+        try:
+            cursor.close(); conn.close()
+        except Exception:
+            pass
+
+def get_skill_progress(user_id):
+    """Per-skill scores across every session this user has completed.
+
+    Reads the answer rows rather than the interview totals, because "you
+    improved" is only useful when it names the skill: an average that moves
+    from 60 to 68 tells a candidate nothing about what to practise next, while
+    "Docker 45% -> 82%, Kubernetes still 30%" tells them exactly.
+
+    Returns {skill: [(session_date, mean_score), ...]} ordered oldest first.
+    """
+    conn = get_db_connection()
+    if not conn:
+        return {}, False
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT i.id, i.session_date, a.question_text, a.score,
+                   a.evaluation_json
+            FROM interviews i
+            JOIN interview_qa a ON a.interview_id = i.id
+            WHERE i.user_id = %s AND a.score IS NOT NULL
+            ORDER BY i.session_date, a.id
+        """, (user_id,))
+        rows = cursor.fetchall()
+    except Error:
+        return {}, False
+    finally:
+        try:
+            cursor.close(); conn.close()
+        except Exception:
+            pass
+
+    # The skill each answer belonged to lives in the evaluation payload; older
+    # rows predate that field, so they are grouped by interview instead of
+    # being dropped.
+    per_session = {}
+    for r in rows:
+        skill = "general"
+        if r.get("evaluation_json"):
+            try:
+                skill = json.loads(r["evaluation_json"]).get("targets_skill") or "general"
+            except (ValueError, TypeError):
+                pass
+        per_session.setdefault((r["id"], r["session_date"]), {}).setdefault(skill, []).append(r["score"])
+
+    progress = {}
+    for (_, when), skills in sorted(per_session.items(), key=lambda kv: kv[0][1]):
+        for skill, scores in skills.items():
+            progress.setdefault(skill, []).append((when, sum(scores) / len(scores)))
+    return progress, True
+
+
+def get_weakest_answers(user_id, limit=3):
+    """The weakest answers from this user's most recent interview.
+
+    Read from the database rather than from session state. The dashboard used
+    st.session_state.interview_answers, which is populated only while an
+    interview is running in the current browser session — so anyone who
+    finished an interview and logged back in later was told to "complete an
+    interview to see recommendations", with a full set of stored evaluations
+    sitting in the database the whole time.
+
+    Scoped to the latest interview because advice should describe where the
+    candidate stands now, not repeat a weakness from months ago they may
+    already have fixed.
+    """
+    conn = get_db_connection()
+    if not conn:
+        return [], False
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT a.score, a.evaluation_json
+            FROM interview_qa a
+            WHERE a.interview_id = (
+                SELECT i.id FROM interviews i
+                JOIN interview_qa qa ON qa.interview_id = i.id
+                WHERE i.user_id = %s AND qa.score IS NOT NULL
+                ORDER BY i.session_date DESC, i.id DESC LIMIT 1
+            ) AND a.score IS NOT NULL
+            ORDER BY a.score ASC LIMIT %s
+        """, (user_id, limit))
+        rows = cursor.fetchall()
+    except Error:
+        return [], False
+    finally:
+        try:
+            cursor.close(); conn.close()
+        except Exception:
+            pass
+
+    out = []
+    for r in rows:
+        ev = {}
+        if r.get("evaluation_json"):
+            try:
+                ev = json.loads(r["evaluation_json"])
+            except (ValueError, TypeError):
+                ev = {}
+        if ev.get("feedback"):
+            out.append({"score": r["score"],
+                        "targets_skill": ev.get("targets_skill") or "General",
+                        "feedback": ev["feedback"]})
+    return out, True
+
 
 def get_user_interview_history(user_id):
+    """Returns (rows, ok). `ok` is False when the database could not be read.
+
+    An empty list used to mean both "this user has no interviews" and "the
+    database is down". The dashboard then displayed a confident zero for
+    someone who might have ten sessions stored — a wrong number is worse than
+    a visible error.
+    """
     conn = get_db_connection()
-    if conn:
+    if not conn:
+        return [], False
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            'SELECT id, job_title, experience_level, score, ai_evaluation, '
+            'session_date FROM interviews WHERE user_id=%s ORDER BY session_date ASC',
+            (user_id,))
+        return cursor.fetchall(), True
+    except Error:
+        return [], False
+    finally:
         try:
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute('SELECT id, job_title, experience_level, score, ai_evaluation, session_date FROM interviews WHERE user_id=%s ORDER BY session_date ASC', (user_id,))
-            return cursor.fetchall()
-        except Error:
-            return []
-        finally:
-            cursor.close()
-            conn.close()
-    return []
+            cursor.close(); conn.close()
+        except Exception:
+            pass
 
 
 if "page" not in st.session_state: st.session_state.page = "Landing"
@@ -509,10 +1095,22 @@ if "cv_uploaded" not in st.session_state: st.session_state.cv_uploaded = False
 if "cv_skills" not in st.session_state: st.session_state.cv_skills = {}
 if "skill_gap" not in st.session_state: st.session_state.skill_gap = {}
 if "generated_questions" not in st.session_state: st.session_state.generated_questions = []
+if "questions_language" not in st.session_state: st.session_state.questions_language = None
 if "interview_answers" not in st.session_state: st.session_state.interview_answers = []
+# The live interview queue. It starts as the generated plan but the agent may
+# insert follow-ups or drop questions mid-interview, so it is kept separately
+# from `generated_questions` (which stays as the record of what was planned).
+if "interview_queue" not in st.session_state: st.session_state.interview_queue = []
+if "interview_evaluations" not in st.session_state: st.session_state.interview_evaluations = []
+if "final_score" not in st.session_state: st.session_state.final_score = None
+if "interview_language" not in st.session_state: st.session_state.interview_language = "en"
+if "covered_skills" not in st.session_state: st.session_state.covered_skills = []
+if "probe_depth" not in st.session_state: st.session_state.probe_depth = 0
+if "off_plan_used" not in st.session_state: st.session_state.off_plan_used = 0
 if "cv_file_name" not in st.session_state: st.session_state.cv_file_name = None
 if "interview_started" not in st.session_state: st.session_state.interview_started = False
 if "current_question" not in st.session_state: st.session_state.current_question = 0
+if "cv_text" not in st.session_state: st.session_state.cv_text = ""
 if "current_interview_id" not in st.session_state: st.session_state.current_interview_id = None
 if "mock_questions" not in st.session_state:
     st.session_state.mock_questions = [
@@ -530,7 +1128,7 @@ def render_landing():
     st.markdown("<div style='text-align: center; padding: 60px 0 40px 0;'>", unsafe_allow_html=True)
     st.markdown("<span class='badge'>✨ Next-Gen AI Mock Interviews</span>", unsafe_allow_html=True)
     st.markdown("<h1 style='font-size: 4rem; margin-top: 15px;' class='gradient-text'>Ace your next job interview <br>with the power of AI</h1>", unsafe_allow_html=True)
-    st.markdown("<p style='font-size: 1.25rem; color: #9CA3AF; max-width: 700px; margin: 20px auto;'>Upload your CV, enter the job description, and let the AI interview engine test you and give you a detailed evaluation that guarantees you're ready.</p>", unsafe_allow_html=True)
+    st.markdown(f"<p style='font-size: 1.25rem; color: {_muted}; max-width: 700px; margin: 20px auto;'>Upload your CV, enter the job description, and let the AI interview engine test you and give you a detailed evaluation that guarantees you're ready.</p>", unsafe_allow_html=True)
 
     col1, col2, col3 = st.columns([1.5, 1, 1.5])
     with col2:
@@ -538,33 +1136,33 @@ def render_landing():
             navigate_to("Auth")
     st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("<hr style='border-color: rgba(255,255,255,0.05); margin: 40px 0;'>", unsafe_allow_html=True)
+    st.markdown(f"<hr style='border-color: {_hr}; margin: 40px 0;'>", unsafe_allow_html=True)
 
     # Features
     st.markdown("<h2 style='text-align: center; margin-bottom: 40px;' class='gradient-text'>Platform Features</h2>", unsafe_allow_html=True)
     f_col1, f_col2, f_col3 = st.columns(3)
     with f_col1:
-        st.markdown('<div class="premium-card"><h3 style="color: #A78BFA;">📄 CV Analysis</h3><p style="color: #9CA3AF;">An LLM-powered processing system that analyzes the strengths, weaknesses, and experience in your CV.</p></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="premium-card"><h3 style="color: {_c_violet};">📄 CV Analysis</h3><p style="color: {_muted};">An LLM-powered processing system that analyzes the strengths, weaknesses, and experience in your CV.</p></div>', unsafe_allow_html=True)
     with f_col2:
-        st.markdown('<div class="premium-card"><h3 style="color: #60A5FA;">🎯 Smart Live Simulation</h3><p style="color: #9CA3AF;">Dynamically generates technical and behavioral questions tailored to the company and job description.</p></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="premium-card"><h3 style="color: {_c_blue};">🎯 Smart Live Simulation</h3><p style="color: {_muted};">Dynamically generates technical and behavioral questions tailored to the company and job description.</p></div>', unsafe_allow_html=True)
     with f_col3:
-        st.markdown('<div class="premium-card"><h3 style="color: #34D399;">📊 Scoring & Evaluation</h3><p style="color: #9CA3AF;">Get a complete dashboard showing your strengths and precise mistakes, along with professional alternative phrasing.</p></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="premium-card"><h3 style="color: {_c_green};">📊 Scoring & Evaluation</h3><p style="color: {_muted};">Get a complete dashboard showing your strengths and precise mistakes, along with professional alternative phrasing.</p></div>', unsafe_allow_html=True)
 
     # Pricing
-    st.markdown("<hr style='border-color: rgba(255,255,255,0.05); margin: 40px 0;'>", unsafe_allow_html=True)
+    st.markdown(f"<hr style='border-color: {_hr}; margin: 40px 0;'>", unsafe_allow_html=True)
     st.markdown("<h2 style='text-align: center; margin-bottom: 40px;' class='gradient-text'>Flexible Subscription Plans</h2>", unsafe_allow_html=True)
 
     p_col1, p_col2, p_col3 = st.columns(3)
     with p_col1:
-        st.markdown('<div class="premium-card" style="border-top: 3px solid #9CA3AF;"><h3>Free Plan</h3><h2 style="margin: 15px 0;">$0 <span style="font-size: 1rem; color: #9CA3AF;">/ month</span></h2><p style="color: #9CA3AF;">• One full interview per month<br>• Basic CV analysis<br>• Simplified report format</p></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="premium-card" style="border-top: 3px solid {_muted};"><h3>Free Plan</h3><h2 style="margin: 15px 0;">$0 <span style="font-size: 1rem; color: {_muted};">/ month</span></h2><p style="color: {_muted};">• One full interview per month<br>• Basic CV analysis<br>• Simplified report format</p></div>', unsafe_allow_html=True)
         if st.button("Choose the Free Plan", key="btn_free"): navigate_to("Auth")
 
     with p_col2:
-        st.markdown('<div class="premium-card" style="border-top: 3px solid #7C3AED; background: rgba(124, 58, 237, 0.03);"><h3>Pro Plan 🔥</h3><h2 style="margin: 15px 0;">$29 <span style="font-size: 1rem; color: #9CA3AF;">/ month</span></h2><p style="color: #A78BFA;">• Unlimited AI-powered interviews<br>• Advanced analysis & JD matching<br>• Precise AI answer evaluation</p></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="premium-card" style="border-top: 3px solid #7C3AED; background: rgba(124, 58, 237, 0.03);"><h3>Pro Plan 🔥</h3><h2 style="margin: 15px 0;">$29 <span style="font-size: 1rem; color: {_muted};">/ month</span></h2><p style="color: {_c_violet};">• Unlimited AI-powered interviews<br>• Advanced analysis & JD matching<br>• Precise AI answer evaluation</p></div>', unsafe_allow_html=True)
         if st.button("Subscribe to Pro Now", key="btn_pro"): navigate_to("Auth")
 
     with p_col3:
-        st.markdown('<div class="premium-card" style="border-top: 3px solid #06B6D4;"><h3>Premium Plan 👑</h3><h2 style="margin: 15px 0;">$79 <span style="font-size: 1rem; color: #9CA3AF;">/ month</span></h2><p style="color: #9CA3AF;">• All Pro plan features<br>• Live voice interview simulation<br>• Custom reports, shareable with companies</p></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="premium-card" style="border-top: 3px solid {_c_cyan};"><h3>Premium Plan 👑</h3><h2 style="margin: 15px 0;">$79 <span style="font-size: 1rem; color: {_muted};">/ month</span></h2><p style="color: {_muted};">• All Pro plan features<br>• Live voice interview simulation<br>• Custom reports, shareable with companies</p></div>', unsafe_allow_html=True)
         if st.button("Subscribe to Premium Now", key="btn_premium"): navigate_to("Auth")
 
 # --- PAGE: AUTHENTICATION (CONNECTED TO MYSQL) ---
@@ -579,13 +1177,19 @@ def render_auth():
         password = st.text_input("Password", type="password", key="login_pass")
         if st.button("Log In", key="btn_login_submit"):
             res = authenticate_user(email, password)
-            if res:
+            if res == "unavailable":
+                # Told apart from wrong credentials on purpose: the old message
+                # covered both, so a user whose database was down went off to
+                # reset a password that was never wrong.
+                st.error("⚠️ Could not reach the database. This is not a problem "
+                         "with your password — please try again shortly.")
+            elif res:
                 st.session_state.is_logged_in = True
                 st.session_state.user_id, st.session_state.user_name = res[0], res[1]
                 st.toast("Logged in successfully! 🎉")
                 navigate_to("Dashboard")
             else:
-                st.error("Invalid login credentials, or the server is not connected.")
+                st.error("Invalid email or password.")
 
     with tab2:
         new_name = st.text_input("Full Name", key="reg_name")
@@ -593,14 +1197,20 @@ def render_auth():
         new_password = st.text_input("Password", type="password", key="reg_pass")
         if st.button("Create Account", key="btn_reg_submit"):
             if new_name and new_email and new_password:
-                if create_user(new_name, new_email, new_password):
+                ok, reason = create_user(new_name, new_email, new_password)
+                if ok:
                     st.success("Account created successfully! Switch to the Login tab now.")
-                else:
+                elif reason == "duplicate":
                     st.error("This email is already registered.")
+                else:
+                    # Not the user's fault, and not something they can fix by
+                    # trying another email — say so instead of blaming them.
+                    st.error("⚠️ Could not reach the database. Your account was "
+                             "NOT created. Please try again shortly.")
             else:
                 st.error("Please fill in all the fields.")
 
-    st.markdown("<div style='text-align: center; margin-top: 15px; color:#9CA3AF;'>Or continue with a global account</div>", unsafe_allow_html=True)
+    st.markdown(f"<div style='text-align: center; margin-top: 15px; color:{_muted};'>Or continue with a global account</div>", unsafe_allow_html=True)
     st.button("🌐 Central Authorization (Google)")
     st.markdown("</div></div>", unsafe_allow_html=True)
 
@@ -608,16 +1218,30 @@ def render_auth():
 def render_dashboard():
     st.markdown(f"<h1 class='gradient-text'>Strategic Dashboard | Welcome, {st.session_state.user_name} 👋</h1>", unsafe_allow_html=True)
 
-    history = get_user_interview_history(st.session_state.user_id)
+    history, history_ok = get_user_interview_history(st.session_state.user_id)
+    if not history_ok:
+        st.warning("⚠️ Could not read your history — the figures below are not "
+                   "your real data.")
     total_interviews = len(history)
     valid_scores = [item['score'] for item in history if item.get('score') is not None]
     avg_score = int(sum(valid_scores) / len(valid_scores)) if len(valid_scores) > 0 else 0
 
+    # Change since the previous session — the single number a returning
+    # candidate actually looks for. Shown only from the second session on,
+    # because "+0%" against nothing is noise.
+    delta_txt = ""
+    if len(valid_scores) >= 2:
+        delta = valid_scores[-1] - valid_scores[-2]
+        arrow = "▲" if delta > 0 else ("▼" if delta < 0 else "▬")
+        colour = _c_green if delta > 0 else (_c_red if delta < 0 else _muted)
+        delta_txt = (f"<div style='color:{colour}; font-size:0.85rem;'>"
+                     f"{arrow} {abs(delta)}% since last session</div>")
+
     m1, m2, m3, m4 = st.columns(4)
-    with m1: st.markdown(f"<div class='premium-card'><small style='color: #9CA3AF;'>Total Interviews</small><h2 style='color:#7C3AED;'>{total_interviews}</h2></div>", unsafe_allow_html=True)
-    with m2: st.markdown(f"<div class='premium-card'><small style='color: #9CA3AF;'>Average Score</small><h2 style='color:#06B6D4;'>{avg_score}%</h2></div>", unsafe_allow_html=True)
-    with m3: st.markdown(f"<div class='premium-card'><small style='color: #9CA3AF;'>CV Status</small><h2 style='color:#34D399;'>{'Analyzed & Uploaded' if st.session_state.cv_uploaded else 'Not uploaded yet'}</h2></div>", unsafe_allow_html=True)
-    with m4: st.markdown("<div class='premium-card'><small style='color: #9CA3AF;'>Current Plan</small><h2 style='color:#F59E0B;'>Pro Plan</h2></div>", unsafe_allow_html=True)
+    with m1: st.markdown(f"<div class='premium-card'><small style='color: {_muted};'>Total Interviews</small><h2 style='color:#7C3AED;'>{total_interviews}</h2></div>", unsafe_allow_html=True)
+    with m2: st.markdown(f"<div class='premium-card'><small style='color: {_muted};'>Latest Score</small><h2 style='color:{_c_cyan};'>{valid_scores[-1] if valid_scores else 0}%</h2>{delta_txt}<small style='color:{_muted_soft};'>average {avg_score}%</small></div>", unsafe_allow_html=True)
+    with m3: st.markdown(f"<div class='premium-card'><small style='color: {_muted};'>CV Status</small><h2 style='color:{_c_green};'>{'Analyzed & Uploaded' if st.session_state.cv_uploaded else 'Not uploaded yet'}</h2></div>", unsafe_allow_html=True)
+    with m4: st.markdown(f"<div class='premium-card'><small style='color: {_muted};'>Current Plan</small><h2 style='color:{_c_amber};'>Pro Plan</h2></div>", unsafe_allow_html=True)
 
     col_left, col_right = st.columns([2, 1])
     with col_left:
@@ -634,11 +1258,280 @@ def render_dashboard():
         st.markdown("</div>", unsafe_allow_html=True)
 
     with col_right:
-        st.markdown('<div class="premium-card"><h3>🤖 Personalized AI Recommendations</h3><p style="color: #9CA3AF; font-size: 0.9rem; line-height: 1.6;">• Focus on explaining <b>System Architecture</b> when asked about your past projects.<br><br>• Your English is excellent, but try to reduce hesitation tokens.<br><br>• Your technical skills are very strong and match 4 currently open positions.</p></div>', unsafe_allow_html=True)
+        progress, prog_ok = get_skill_progress(st.session_state.user_id)
+        multi = {k: v for k, v in progress.items() if len(v) >= 2}
+        if prog_ok and multi:
+            improved, declined, stuck = [], [], []
+            for skill, points in multi.items():
+                first, last = points[0][1], points[-1][1]
+                change = (last - first) * 100
+                row = (skill, first * 100, last * 100, change)
+                if change >= 5:
+                    improved.append(row)
+                elif change <= -5:
+                    declined.append(row)
+                elif last < 0.5:
+                    stuck.append(row)
+
+            body = ""
+            for title, group, colour, sign in (
+                ("تحسّنت / Improved", sorted(improved, key=lambda r: -r[3]), _c_green, "+"),
+                ("تراجعت / Declined", sorted(declined, key=lambda r: r[3]), _c_red, ""),
+                ("ما زالت ضعيفة / Still weak", stuck, _c_yellow, ""),
+            ):
+                if not group:
+                    continue
+                body += f"<p style='color:{colour}; margin:8px 0 2px;'><b>{title}</b></p>"
+                for skill, first, last, change in group[:4]:
+                    body += (f"<p style='margin:2px 0; font-size:0.85rem;'>• {skill}: "
+                             f"{first:.0f}% → <b>{last:.0f}%</b> "
+                             f"<span style='color:{colour};'>({sign}{change:.0f}%)</span></p>")
+            st.markdown(
+                f"<div class='premium-card'><h3>📊 Skill Progress</h3>{body}"
+                f"<p style='color:{_muted_soft}; font-size:0.75rem; margin-top:10px;'>"
+                f"Compared across your sessions, first to latest.</p></div>",
+                unsafe_allow_html=True)
+        elif prog_ok and progress:
+            st.markdown(
+                "<div class='premium-card'><h3>📊 Skill Progress</h3>"
+                f"<p style='color:{_muted}; font-size:0.9rem;'>Complete a second "
+                "interview on the same skills to see how much you improved.</p></div>",
+                unsafe_allow_html=True)
+
+        # Recommendations are the evaluator's own feedback on the weakest
+        # answers, so they refer to what this candidate actually said rather
+        # than to a fixed sentence. Session state is preferred only while an
+        # interview is actually running in this tab, since it holds answers
+        # not yet written; otherwise the stored evaluations are read back, so
+        # the advice survives logging out.
+        rated = [a for a in st.session_state.interview_answers
+                 if isinstance(a.get("score"), (int, float)) and a.get("feedback")]
+        rec_ok = True
+        if not rated:
+            rated, rec_ok = get_weakest_answers(st.session_state.user_id)
+        weakest = sorted(rated, key=lambda a: a["score"])[:3]
+        if weakest:
+            items = "<br><br>".join(
+                f"• <b>{a.get('targets_skill') or 'General'}</b> "
+                f"({a['score'] * 100:.0f}%) — {a['feedback']}" for a in weakest)
+        elif not rec_ok:
+            items = ("Could not read your past evaluations — the database is "
+                     "unreachable right now.")
+        else:
+            items = "Complete an interview to see recommendations based on your own answers."
+        st.markdown(
+            '<div class="premium-card"><h3>🤖 Personalized AI Recommendations</h3>'
+            f'<p style="color: {_muted}; font-size: 0.9rem; line-height: 1.6;">'
+            f'{items}</p></div>', unsafe_allow_html=True)
+
+def _rtl(text: str) -> str:
+    """Wrap generated text so Arabic renders right-to-left.
+
+    Applied per string rather than per page, because the interface labels stay
+    English while the questions, feedback and reasoning are in the candidate's
+    language.
+    """
+    if st.session_state.get("interview_language") != "ar":
+        return text
+    return f"<span class='rtl' style='display:block;'>{text}</span>"
+
+
+def _skill_verdict(avg: float, untested: bool = False) -> tuple:
+    """Colour and wording for one skill in the final report.
+
+    The two cut-offs are imported from ai_engine rather than chosen here, and
+    they are the same ones the agent routes on during the interview: below
+    ANSWER_WEAK_THRESHOLD it abandons the skill, above ANSWER_STRONG_THRESHOLD
+    it probes deeper. Reusing them means the report cannot call a skill
+    "solid" that the agent walked away from mid-interview — the candidate
+    reads the same judgement the system acted on.
+
+    `untested` is separate from any score. Every answer on this skill missed
+    the topic, so nothing was learned about it — and "we did not find out" must
+    not be printed as "weak", which is a claim about the candidate.
+    """
+    if untested:
+        return _muted, "not tested — the answer did not address it"
+    if avg < ANSWER_WEAK_THRESHOLD:
+        return _c_red, "weak — needs work"
+    if avg > ANSWER_STRONG_THRESHOLD:
+        return _c_green, "strong"
+    return _c_yellow, "adequate"
+
+
+# Snippets the toolbar inserts. Each is a Markdown construct the preview and
+# the final report both render, so what the candidate formats is what everyone
+# later reads.
+# ==========================================
+#  Answer integrity
+# ==========================================
+# Two independent signals, deliberately of different kinds.
+#
+# 1. Typing rate — measured on the SERVER from the moment the question is
+#    rendered to the moment the answer is submitted. It cannot be faked from
+#    the browser, and it is decisive: the world record for sustained copy
+#    typing is about 212 wpm, while composing an answer while thinking rarely
+#    exceeds 40-60. A 500-word answer submitted in 15 seconds is 2000 wpm,
+#    which is not a fast typist.
+#
+# 2. Focus loss — counted in the browser. Weaker evidence (a notification can
+#    steal focus innocently) and defeatable by a second device, so it is
+#    reported as context rather than used as proof. Its real value is
+#    deterrence: candidates are told it is recorded.
+_WPM_SUSPICIOUS = 120      # above careful composition, still humanly possible
+_WPM_IMPOSSIBLE = 200      # past the sustained human record — pasted
+_MIN_WORDS_TO_JUDGE = 40   # short answers give too little signal to rate
+
+
+def _integrity_check(text: str, seconds: float, focus_losses: int) -> dict:
+    """Score how plausible it is that this answer was actually typed here."""
+    words = len(text.split())
+    wpm = (words / (seconds / 60)) if seconds > 0 else 0.0
+
+    if words < _MIN_WORDS_TO_JUDGE:
+        verdict = "too_short_to_judge"
+    elif wpm >= _WPM_IMPOSSIBLE:
+        verdict = "pasted"
+    elif wpm >= _WPM_SUSPICIOUS:
+        verdict = "suspicious"
+    else:
+        verdict = "plausible"
+
+    return {
+        "seconds": round(seconds, 1),
+        "words": words,
+        "wpm": round(wpm),
+        "focus_losses": focus_losses,
+        "verdict": verdict,
+    }
+
+
+def _focus_tracker(idx: int) -> None:
+    """Count how many times the candidate leaves this tab.
+
+    Streamlit's components.html runs in a sandboxed iframe with no channel
+    back to Python, so the count is written into the parent page's query
+    string; the next rerun — which the submit button causes — reads it. Best
+    effort by nature: it cannot see a second screen or a phone, which is
+    exactly why the typing rate above carries the real weight.
+    """
+    components.html(
+        f"""<script>
+        (function () {{
+          const doc = window.parent.document;
+          const KEY = 'focus_lost_{idx}';
+          if (doc.__introTracker === KEY) return;   // Streamlit re-runs constantly
+          doc.__introTracker = KEY;
+          let lost = 0;
+          const push = () => {{
+            const u = new URL(window.parent.location);
+            u.searchParams.set('fl', lost);
+            window.parent.history.replaceState({{}}, '', u);
+          }};
+          window.parent.addEventListener('blur', () => {{ lost++; push(); }});
+          doc.addEventListener('visibilitychange', () => {{
+            if (doc.hidden) {{ lost++; push(); }}
+          }});
+        }})();
+        </script>""",
+        height=0,
+    )
+
+
+_EDITOR_SNIPPETS = [
+    ("**B**", "**نص غليظ**", "**bold text**", "غليظ / bold"),
+    ("*I*", "*نص مائل*", "*italic text*", "مائل / italic"),
+    ("`</>`", "`كود`", "`code`", "كود قصير / inline code"),
+    ("▤", "\n```python\nprint('hello')\n```\n", "\n```python\nprint('hello')\n```\n",
+     "كتلة كود / code block"),
+    ("•", "\n- عنصر أول\n- عنصر ثانٍ\n", "\n- first point\n- second point\n",
+     "نقاط / bullets"),
+    ("1.", "\n1. الخطوة الأولى\n2. الخطوة الثانية\n",
+     "\n1. first step\n2. second step\n", "ترقيم / numbered"),
+]
+
+
+def _answer_editor(label: str, idx: int) -> str:
+    """A formatting-aware answer box.
+
+    Streamlit's text_area is plain text and gives no access to the caret, so a
+    true WYSIWYG toolbar is not possible without a third-party component — and
+    those are heavy, which matters on a 1 GB deployment. Instead the toolbar
+    appends Markdown snippets the candidate then edits, and a live preview
+    shows exactly how the answer will be rendered.
+
+    The buttons must run BEFORE the text_area is created: Streamlit forbids
+    writing to a widget's session_state key after that widget exists in the
+    same run.
+    """
+    key = f"ans_{idx}"
+    st.session_state.setdefault(key, "")
+    is_ar = st.session_state.interview_language == "ar"
+
+    # The clock starts when the question first appears, not when typing starts:
+    # the gap between the two is thinking time, which is exactly what a pasted
+    # answer skips.
+    st.session_state.setdefault(f"t0_{idx}", time.time())
+    _focus_tracker(idx)
+
+    cols = st.columns(len(_EDITOR_SNIPPETS) + 1)
+    for col, (face, ar_text, en_text, tip) in zip(cols, _EDITOR_SNIPPETS):
+        if col.button(face, key=f"tb_{idx}_{face}", help=tip,
+                      use_container_width=True):
+            snippet = ar_text if is_ar else en_text
+            current = st.session_state[key]
+            joiner = "" if (not current or current.endswith(("\n", " "))) else " "
+            st.session_state[key] = current + joiner + snippet
+            st.rerun()
+
+    show_preview = cols[-1].toggle("👁", key=f"pv_{idx}",
+                                   help="معاينة / preview")
+
+    text = st.text_area(label, key=key, height=160,
+                        placeholder=("يمكنك استخدام **غليظ** و `كود` و - نقاط"
+                                     if is_ar else
+                                     "You can use **bold**, `code` and - bullets"))
+
+    if show_preview and text.strip():
+        st.caption("المعاينة / Preview")
+        st.markdown(_rtl(text) if is_ar else text, unsafe_allow_html=is_ar)
+
+    elapsed = time.time() - st.session_state[f"t0_{idx}"]
+    words = len(text.split())
+    mins, secs = divmod(int(elapsed), 60)
+    # Stated openly. A hidden check is surveillance; a declared one is a rule,
+    # and telling candidates it exists is most of its deterrent value.
+    st.caption(
+        f"⏱️ {mins}:{secs:02d}  ·  {words} "
+        + ("كلمة  ·  الوقت وتبديل النوافذ مُسجَّلان لضمان نزاهة التدريب"
+           if is_ar else
+           "words  ·  time and tab switches are recorded for training integrity")
+    )
+    return text
+
+
+def _reset_interview_state():
+    """Clear everything the live interview accumulates.
+
+    The queue, the evaluations and the agent's budget counters all carry over
+    between Streamlit reruns by design; without an explicit reset a second
+    interview would inherit the first one's follow-ups and scores.
+    """
+    st.session_state.interview_queue = []
+    st.session_state.interview_evaluations = []
+    st.session_state.covered_skills = []
+    st.session_state.probe_depth = 0
+    st.session_state.off_plan_used = 0
+    st.session_state.final_score = None
+
 
 def _extract_pdf_text(uploaded_file) -> str:
+    # Normalised on the way in: Arabic PDFs return presentation-form glyphs
+    # rather than base letters, which look right but compare wrong. See
+    # normalize_text() in ai_engine.py.
     reader = PdfReader(uploaded_file)
-    return "\n".join(page.extract_text() or "" for page in reader.pages)
+    raw = "\n".join(page.extract_text() or "" for page in reader.pages)
+    return normalize_text(raw)
 
 # --- PAGE: UPLOAD SYSTEM (CONNECTED TO MYSQL) ---
 def render_upload():
@@ -666,7 +1559,21 @@ def render_upload():
             st.session_state.cv_uploaded = True
             st.session_state.cv_skills = result
             st.session_state.cv_file_name = uploaded_file.name
+            # Kept, not discarded: the coverage call reads it for evidence the
+            # skill list drops by design — a job title, an employer, a field of
+            # study. Session state only; it is not written to the database.
+            st.session_state.cv_text = cv_text
+            # The CV's language supplies the default, detected here once from
+            # the text before it is discarded. It is a suggestion, not a
+            # verdict: uploading a CV re-seeds the selector, and whatever the
+            # candidate then chooses is what every later stage is given.
+            st.session_state.interview_language = detect_language(cv_text)
+            st.session_state.lang_choice = (
+                "Arabic / العربية" if st.session_state.interview_language == "ar"
+                else "English (Professional)")
             st.success(f"CV analyzed successfully — {total} skills extracted.")
+            if st.session_state.interview_language == "ar":
+                st.info("تم اكتشاف سيرة ذاتية بالعربية — ستكون المقابلة والتقييم بالعربية.")
 
     if st.session_state.cv_skills:
         tech = st.session_state.cv_skills.get("technical_skills", [])
@@ -690,27 +1597,121 @@ def render_upload():
     st.markdown("<div class='premium-card'>", unsafe_allow_html=True)
     st.subheader("2. Target Job Details")
     job_title = st.text_input("Target Job Title", "Software Engineer")
-    job_desc = st.text_area("Enter the Job Description", value="Write the job description details here...")
+    # Placeholder rather than a pre-filled value: the old default made the user
+    # delete a sentence before typing, and it had to be string-matched below to
+    # tell "untouched" from "empty".
+    #
+    # The hint is not only politeness. Salary, benefits, working hours, location
+    # and how-to-apply carry no skills, so they add prompt tokens and give the
+    # model more irrelevant text to reason over — a full posting is what pushed
+    # one request into spending its entire budget deliberating without ever
+    # writing an answer. Trimming shrinks every call, not just the failing ones.
+    job_desc = st.text_area(
+        "Enter the Job Description",
+        placeholder=("Paste the responsibilities and requirements.\n\n"
+                     "You can leave out salary, benefits, working hours, "
+                     "location and how-to-apply — they hold no skills, and "
+                     "dropping them makes the analysis faster and more accurate."),
+        height=170,
+        help="Only the responsibilities and requirements are read. Everything "
+             "else in a posting is ignored, so pasting it just slows the "
+             "analysis down.",
+    )
 
     col1, col2 = st.columns(2)
     with col1: experience = st.selectbox("Current Experience Level", ["Junior (0-2 years)", "Mid-Level (2-5 years)", "Senior (5+ years)"])
-    with col2: lang_level = st.selectbox("Required Interview Language", ["English (Professional)", "Arabic / العربية"])
+    with col2:
+        # Detection from the CV supplies the default; the candidate decides.
+        # An English CV does not mean an English interview — in this market a
+        # candidate with an English technical CV is very often interviewed in
+        # Arabic, and the supervisor's stated reason for Arabic support is
+        # reaching sectors outside tech at all.
+        _lang_options = ["English (Professional)", "Arabic / العربية"]
+        # The widget owns its own session key. Without one, Streamlit rebuilds
+        # the selectbox from `index` on every rerun, and `index` was computed
+        # from the value the widget itself had just written — so a choice made
+        # here was silently reverted to whatever the CV had been detected as.
+        if "lang_choice" not in st.session_state:
+            st.session_state.lang_choice = _lang_options[
+                1 if st.session_state.interview_language == "ar" else 0]
+        st.selectbox(
+            "Interview Language", _lang_options, key="lang_choice",
+            help="Detected from your CV, and yours to change. If you change it "
+                 "after analysing, run the analysis again so the questions are "
+                 "rewritten in that language.",
+        )
+        st.session_state.interview_language = (
+            "ar" if st.session_state.lang_choice.startswith("Arabic") else "en")
+
+        # Questions are written once, in the language that was selected at the
+        # time. Changing the language afterwards cannot rewrite them, so the
+        # mismatch is stated rather than left for the candidate to discover in
+        # the middle of the interview.
+        _qlang = st.session_state.get("questions_language")
+        if st.session_state.generated_questions and _qlang and \
+                _qlang != st.session_state.interview_language:
+            st.info(
+                "The questions prepared earlier are in "
+                + ("Arabic" if _qlang == "ar" else "English")
+                + ". They will be rewritten in the language selected here when "
+                  "the interview is generated.")
 
     if st.button("🔍 Analyze the Gap Between Your Skills and the Job"):
         if not st.session_state.cv_skills:
             st.warning("Upload your CV and analyze your skills first (step 1) before running the gap analysis.")
-        elif not job_desc.strip() or job_desc.strip() == "Write the job description details here...":
+        elif not job_desc.strip():
             st.warning("Enter the actual job description first.")
         else:
             with st.spinner("Analyzing the job requirements and comparing them to your skills..."):
-                pipeline_result = run_cv_jd_pipeline(jd_text=job_desc, cv_skills=st.session_state.cv_skills)
+                pipeline_result = run_cv_jd_pipeline(
+                    jd_text=job_desc,
+                    cv_text=st.session_state.get("cv_text", ""),
+                    cv_skills=st.session_state.cv_skills,
+                    language=st.session_state.interview_language,
+                )
                 if pipeline_result.get("error"):
                     st.session_state.skill_gap = {}
                     st.session_state.generated_questions = []
                     st.error(f"Could not analyze the job description: {pipeline_result['error']}")
                 else:
                     st.session_state.skill_gap = pipeline_result["skill_gap"]
+                    # Needed later by the agent to build the skill vocabulary
+                    # it scores answers against.
+                    st.session_state.jd_skills = pipeline_result.get("jd_skills", {})
                     st.session_state.generated_questions = pipeline_result.get("questions", {}).get("questions", [])
+                    st.session_state.questions_language = \
+                        st.session_state.interview_language
+                    _jd = st.session_state.jd_skills
+                    _n_jd = sum(len(_jd.get(k) or []) for k in
+                                ("technical_skills", "soft_skills", "languages"))
+                    st.success(f"Job description analyzed — {_n_jd} required "
+                               f"skills extracted.")
+
+    # The same view the CV gets in step 1. Until now the job's requirements were
+    # extracted and then shown only inside the gap card, where a skill appears
+    # solely when it is *missing* — so everything the CV already covered stayed
+    # invisible, and the extraction itself could not be checked. Listing both
+    # sides in the same shape makes them directly comparable.
+    if st.session_state.get("jd_skills"):
+        jd = st.session_state.jd_skills
+        jd_tech = jd.get("technical_skills") or []
+        jd_soft = jd.get("soft_skills") or []
+        jd_langs = jd.get("languages") or []
+        with st.expander(
+                f"View skills required by the job "
+                f"({len(jd_tech) + len(jd_soft) + len(jd_langs)})", expanded=True):
+            if jd_tech:
+                st.markdown("**Technical Skills**")
+                for skill in jd_tech:
+                    st.markdown(f"- {skill}")
+            if jd_soft:
+                st.markdown("**Soft Skills**")
+                for skill in jd_soft:
+                    st.markdown(f"- {skill}")
+            if jd_langs:
+                st.markdown("**Languages**")
+                for lang in jd_langs:
+                    st.markdown(f"- {lang}")
 
     if st.session_state.skill_gap:
         gap = st.session_state.skill_gap
@@ -719,6 +1720,46 @@ def render_upload():
         missing_langs = gap.get("missing_languages", [])
         total_missing = len(missing_tech) + len(missing_soft) + len(missing_langs)
         with st.expander(f"Gap analysis result ({total_missing} missing skills)", expanded=True):
+            # The gap alone is a conclusion with its working hidden: a skill is
+            # listed as missing and there is no way to see what it was compared
+            # against. Showing the two source lists beside it makes the result
+            # checkable — a requirement marked missing that plainly matches
+            # something in the CV column is a visible bug, not a silent one.
+            jd_all = st.session_state.get("jd_skills") or {}
+            cv_all = st.session_state.get("cv_skills") or {}
+            gap_all = {s.strip().lower()
+                       for s in missing_tech + missing_soft + missing_langs}
+
+            def _column(title, data, mark_gap):
+                lines = []
+                for key, label in (("technical_skills", "Technical"),
+                                   ("soft_skills", "Soft"),
+                                   ("languages", "Languages")):
+                    items = data.get(key) or []
+                    if not items:
+                        continue
+                    lines.append(f"<p style='margin:10px 0 4px;'><b>{label}</b> "
+                                 f"<span style='color:{_muted};font-size:.8rem;'>"
+                                 f"({len(items)})</span></p>")
+                    for s in items:
+                        missing = mark_gap and s.strip().lower() in gap_all
+                        colour = _c_red if missing else _muted
+                        flag = " ✗" if missing else ""
+                        lines.append(
+                            f"<p style='margin:1px 0;font-size:.88rem;color:{colour};'>"
+                            f"• {s}{flag}</p>")
+                body = "".join(lines) or f"<p style='color:{_muted};'>—</p>"
+                return (f"<div class='premium-card'><h4>{title}</h4>{body}</div>")
+
+            side_jd, side_cv = st.columns(2)
+            with side_jd:
+                st.markdown(_column("📋 The job asks for", jd_all, True),
+                            unsafe_allow_html=True)
+            with side_cv:
+                st.markdown(_column("👤 Your CV shows", cv_all, False),
+                            unsafe_allow_html=True)
+            st.caption("✗ = required but not covered by anything in your CV")
+
             if total_missing == 0:
                 st.success("Your skills cover all the requirements visible in the job description! 🎉")
             else:
@@ -747,14 +1788,31 @@ def render_upload():
         elif not st.session_state.cv_skills:
             st.warning("Upload and analyze your CV first (step 1).")
         else:
-            if not st.session_state.generated_questions:
+            # Regenerate when the questions on hand were written in a language
+            # other than the one now selected. Without the second test the
+            # selector is advisory: questions written in Arabic at the gap
+            # step survived a switch to English and the interview ran in the
+            # language the candidate had just changed away from.
+            _stale_lang = (st.session_state.get("questions_language") is not None
+                           and st.session_state.questions_language
+                           != st.session_state.interview_language)
+            if not st.session_state.generated_questions or _stale_lang:
                 with st.spinner("Generating gap-prioritized interview questions..."):
-                    pipeline_result = run_cv_jd_pipeline(jd_text=job_desc, cv_skills=st.session_state.cv_skills)
+                    pipeline_result = run_cv_jd_pipeline(
+                    jd_text=job_desc,
+                    cv_skills=st.session_state.cv_skills,
+                    language=st.session_state.interview_language,
+                )
                     if pipeline_result.get("error"):
                         st.error(f"Could not generate the interview questions: {pipeline_result['error']}")
                         st.stop()
                     st.session_state.skill_gap = pipeline_result["skill_gap"]
+                    # Needed later by the agent to build the skill vocabulary
+                    # it scores answers against.
+                    st.session_state.jd_skills = pipeline_result.get("jd_skills", {})
                     st.session_state.generated_questions = pipeline_result.get("questions", {}).get("questions", [])
+                    st.session_state.questions_language = \
+                        st.session_state.interview_language
 
             with st.spinner("Initializing the AI interview server in the database..."):
                 int_id = create_interview_session(st.session_state.user_id, job_title, experience, job_desc)
@@ -763,78 +1821,430 @@ def render_upload():
                     st.session_state.interview_started = True
                     st.session_state.current_question = 0
                     st.session_state.interview_answers = []
+                    _reset_interview_state()
+                    st.session_state.interview_queue = [
+                        dict(q) for q in st.session_state.generated_questions]
+                    save_interview_progress(int_id)
                     st.toast("Session and engine built successfully! 🚀")
                     navigate_to("Interview Engine")
                 else:
-                    st.error("Database connection error. Make sure XAMPP is running.")
+                    st.error(f"⚠️ Could not create the interview session — "
+                             f"database unreachable ({_DB_ERROR}). Nothing was saved.")
     st.markdown("</div>", unsafe_allow_html=True)
+
+def render_db_badge():
+    """A visible, honest indicator of whether anything is being saved.
+
+    Placed in the sidebar because a silent database is invisible otherwise —
+    the interview looks identical whether or not a single row is written.
+    """
+    ok, detail = db_status()
+    if ok:
+        st.sidebar.caption(f"🟢 Database connected · {detail}")
+    else:
+        st.sidebar.error("🔴 Database NOT connected — nothing is being saved.")
+        st.sidebar.caption(detail)
+
 
 def render_interview():
     st.markdown("<h1 class='gradient-text'>🤖 Live AI Interview Simulator</h1>", unsafe_allow_html=True)
 
+    # The answer box is the one input the candidate types Arabic into, so it
+    # is flipped only while an Arabic interview is running. Injected here
+    # rather than in the global stylesheet because the language is chosen
+    # after that stylesheet has already been written.
+    if st.session_state.interview_language == "ar":
+        st.markdown(
+            "<style>[data-testid='stTextArea'] textarea"
+            "{direction: rtl; text-align: right;}</style>",
+            unsafe_allow_html=True)
+
     if not st.session_state.interview_started or st.session_state.current_interview_id is None:
+        # This is where a candidate lands after logging back in, so it is where
+        # an interrupted interview has to be offered back to them. Anything
+        # that clears session_state — a logout, a browser refresh, the host
+        # putting the app to sleep — brings them here mid-interview.
+        pending_row, pending_state = load_unfinished_interview(st.session_state.user_id)
+        if pending_row and pending_state:
+            answered = len(pending_state.get("interview_answers") or [])
+            total = len(pending_state.get("interview_queue") or [])
+            st.markdown(
+                f"<div class='premium-card' style='border-left: 4px solid {_c_amber};'>"
+                f"<h3>⏸️ You have an unfinished interview</h3>"
+                f"<p><b>{pending_row['job_title']}</b> — "
+                f"{answered} of {total} questions answered, started "
+                f"{pending_row['session_date']:%d %b %Y at %H:%M}.</p>"
+                f"<p style='color:{_muted}; font-size:0.9rem;'>Your answers were "
+                f"saved as you submitted them. Continuing picks up at the next "
+                f"question; starting fresh leaves this session scored as it "
+                f"stands.</p></div>",
+                unsafe_allow_html=True)
+            resume_col, fresh_col = st.columns(2)
+            with resume_col:
+                if st.button("▶️ Continue where I left off", key="btn_resume"):
+                    for field, value in pending_state.items():
+                        st.session_state[field] = value
+                    st.session_state.current_interview_id = pending_row["id"]
+                    st.session_state.interview_started = True
+                    st.session_state.cv_uploaded = bool(pending_state.get("cv_skills"))
+                    st.rerun()
+            with fresh_col:
+                if st.button("🆕 Start a new interview instead", key="btn_fresh"):
+                    navigate_to("Upload System")
+
         st.markdown("<div class='premium-card' style='text-align: center; padding: 40px;'>", unsafe_allow_html=True)
         st.write("The engine is waiting for data setup from the Upload System page.")
         if st.button("Go to the Upload page now"):
             navigate_to("Upload System")
         st.markdown("</div>", unsafe_allow_html=True)
     else:
-        # Use the gap-prioritized questions generated by the LangGraph pipeline.
-        # Fall back to the static sample questions only if generation produced nothing.
-        generated = st.session_state.generated_questions
-        if generated:
-            question_texts = [q["question"] for q in generated]
-        else:
-            question_texts = st.session_state.mock_questions
+        # The queue starts as the generated plan, then the agent reshapes it as
+        # the interview runs. Seeded once so an in-progress interview survives
+        # Streamlit's reruns.
+        if not st.session_state.interview_queue:
+            st.session_state.interview_queue = [
+                dict(q) for q in st.session_state.generated_questions
+            ] or [{"question": t, "targets_skill": "", "is_soft_skill": False}
+                  for t in st.session_state.mock_questions]
 
+        queue = st.session_state.interview_queue
         curr_idx = st.session_state.current_question
-        total_qs = len(question_texts)
+        # The ceiling is applied here, to the number of questions the interview
+        # will actually ask, and not only inside the agent. The agent's check
+        # stops it from ADDING a question once MAX_TOTAL_QUESTIONS have been
+        # asked — but every follow-up it inserted earlier pushed the planned
+        # questions back, and those were still asked afterwards. A real
+        # interview reached 13 questions against a ceiling of 12, and the
+        # ceiling's own message ("13/12 asked") appeared only on the question
+        # it should have prevented. Capping total_qs makes is_last fire at
+        # question 12, so the interview finalises there whatever the queue
+        # still holds; budget_left, passed to the agent below, is then measured
+        # against the same limit the interview really enforces.
+        total_qs = min(len(queue), MAX_TOTAL_QUESTIONS)
 
         if curr_idx < total_qs:
-            current_q_text = question_texts[curr_idx]
-           
-            st.markdown(f"<div class='premium-card' style='border-left: 4px solid #7C3AED;'><h5>Current Question ({curr_idx + 1} of {total_qs}):</h5><h3 style='color: #A78BFA;'>{current_q_text}</h3></div>", unsafe_allow_html=True)
-            user_ans = st.text_area("Enter your full answer here:", key=f"ans_{curr_idx}", height=120)
+            current_q = queue[curr_idx]
+            current_q_text = current_q["question"]
+            is_last = curr_idx >= total_qs - 1
 
-            def _record_answer():
-                save_question_answer(st.session_state.current_interview_id, current_q_text, user_ans)
-                st.session_state.interview_answers.append({"question": current_q_text, "answer": user_ans})
+            st.markdown(
+                f"<div class='premium-card' style='border-left: 4px solid #7C3AED;'>"
+                f"<h5>Current Question ({curr_idx + 1} of {total_qs}):</h5>"
+                f"<h3 style='color: {_c_violet};'>{_rtl(current_q_text)}</h3></div>",
+                unsafe_allow_html=True,
+            )
+            answer_label = ("اكتب إجابتك الكاملة هنا:"
+                            if st.session_state.interview_language == "ar"
+                            else "Enter your full answer here:")
+            user_ans = _answer_editor(answer_label, curr_idx)
+            # Set once this question's answer has been evaluated and stored.
+            # A second click that arrives while the first is still running
+            # reruns the page at the same index; without this it evaluated the
+            # same answer again and let the agent decide a second time.
+            _done_key = (f"answered_{st.session_state.current_interview_id}"
+                         f"_{curr_idx}")
 
-            if curr_idx < total_qs - 1:
+            def _process_answer():
+                """Evaluate the answer, then let the agent decide what comes next.
+
+                This is where the interview stops being a fixed list: the agent
+                may append a follow-up it just generated, or drop the remaining
+                questions on a skill the candidate clearly does not have.
+                """
+                state = {
+                    "remaining_skills": [q.get("targets_skill", "")
+                                         for q in queue[curr_idx + 1:]],
+                    "covered_skills": st.session_state.covered_skills,
+                    "asked_count": curr_idx + 1,
+                    "budget_left": max(0, total_qs - curr_idx - 1),
+                    "probe_depth": st.session_state.probe_depth,
+                    "off_plan_used": st.session_state.off_plan_used,
+                }
+                cycle = run_answer_cycle(
+                    current_q, user_ans,
+                    st.session_state.cv_skills, st.session_state.get("jd_skills", {}),
+                    state, language=st.session_state.interview_language,
+                )
+
+                evaluation = cycle.get("evaluation", {})
+                score = evaluation.get("final_score")
+                feedback = evaluation.get("feedback", "")
+
+                # Measured before anything else touches the clock.
+                integrity = _integrity_check(
+                    user_ans,
+                    time.time() - st.session_state.get(f"t0_{curr_idx}", time.time()),
+                    int(st.query_params.get("fl", 0) or 0),
+                )
+                evaluation = dict(evaluation)
+                evaluation["integrity"] = integrity
+                # Stored with the answer so progress can later be reported per
+                # skill. The column holds only the question text, and matching
+                # a skill back out of that text would be guesswork.
+                evaluation["targets_skill"] = current_q.get("targets_skill", "")
+                # The agent's decision, stored with the answer for the same
+                # reason targets_skill is. These four lived only in
+                # st.session_state, so they were shown in the report and then
+                # lost when the browser session ended: two completed interviews
+                # exist in the database with no record of what the agent chose
+                # at any point, and whether a probe happened had to be inferred
+                # from the wording of the next question.
+                #
+                # used_fallback matters most. It was added to measure how often
+                # the model replies without invoking a tool — a number that
+                # belongs in the results chapter — and it could never be
+                # computed, because nothing wrote it down.
+                evaluation["route"] = cycle.get("route")
+                evaluation["reason"] = cycle.get("reason", "")
+                evaluation["thought"] = (cycle.get("thought") or "")[:1200]
+                evaluation["used_fallback"] = cycle.get("used_fallback")
+                evaluation["budget_capped"] = cycle.get("budget_capped")
+
+                save_question_answer(st.session_state.current_interview_id,
+                                     current_q_text, user_ans,
+                                     score=score, evaluation=evaluation)
+                st.session_state.interview_answers.append({
+                    "question": current_q_text,
+                    "answer": user_ans,
+                    "targets_skill": current_q.get("targets_skill", ""),
+                    "score": score,
+                    "feedback": feedback,
+                    "skill_untested": evaluation.get("skill_untested", False),
+                    "route": cycle.get("route"),
+                    "reason": cycle.get("reason", ""),
+                    "thought": cycle.get("thought", ""),
+                    "used_fallback": cycle.get("used_fallback"),
+                    "integrity": integrity,
+                })
+                if "error" not in cycle:
+                    st.session_state.interview_evaluations.append(evaluation)
+
+                # --- act on the agent's decision -------------------------
+                route = cycle.get("route")
+                new_q = cycle.get("new_question")
+                if route == "probe" and new_q:
+                    queue.insert(curr_idx + 1, new_q)
+                    st.session_state.probe_depth += 1
+                elif route == "ask_about_skill" and new_q:
+                    queue.insert(curr_idx + 1, new_q)
+                    st.session_state.off_plan_used += 1
+                    st.session_state.probe_depth = 0
+                else:
+                    st.session_state.probe_depth = 0
+                    skill = current_q.get("targets_skill", "")
+                    if skill and skill not in st.session_state.covered_skills:
+                        st.session_state.covered_skills.append(skill)
+                    if route == "skip_skill" and skill:
+                        # Drop the rest of this skill's questions rather than
+                        # pressing on a topic already shown to be a dead end.
+                        st.session_state.interview_queue = (
+                            queue[:curr_idx + 1]
+                            + [q for q in queue[curr_idx + 1:]
+                               if q.get("targets_skill") != skill]
+                        )
+                # The snapshot goes last, so it records the queue as the
+                # agent has just reshaped it rather than as it was before.
+                save_interview_progress(
+                    st.session_state.current_interview_id,
+                    next_index=curr_idx if cycle.get("error") else curr_idx + 1)
+                if not cycle.get("error"):
+                    st.session_state[_done_key] = True
+                return cycle
+
+            if not is_last:
                 if st.button("Submit Answer & Go to Next Question ➡️"):
-                    _record_answer()
-                    st.session_state.current_question += 1
-                    st.toast("Answer saved successfully!")
-                    st.rerun()
+                    if st.session_state.get(_done_key):
+                        cycle = {}
+                    else:
+                        with st.spinner("Evaluating your answer..."):
+                            cycle = _process_answer()
+                    if cycle.get("error"):
+                        st.error(cycle["error"])
+                    else:
+                        st.session_state.current_question += 1
+                        st.rerun()
             else:
                 if st.button("Finish Interview & Get Results 🎓"):
-                    _record_answer()
-                    # Simulate saving the overall evaluation to the database
-                    finalize_interview(st.session_state.current_interview_id, 87, "Excellent engineering performance — your answers are precise and show a deep understanding of embedded systems and system architecture.")
-                    st.session_state.current_question += 1
-                    st.rerun()
+                    if st.session_state.get(_done_key):
+                        cycle = {}
+                    else:
+                        with st.spinner("Evaluating your final answer..."):
+                            cycle = _process_answer()
+                    if cycle.get("error"):
+                        st.error(cycle["error"])
+                    else:
+                        summary = " ".join(
+                            a["feedback"] for a in st.session_state.interview_answers
+                            if a.get("feedback"))[:2000]
+                        # The score comes back from the database rather than
+                        # being computed here, so what is stored and what is
+                        # shown are the same number by construction.
+                        st.session_state.final_score = finalize_interview(
+                            st.session_state.current_interview_id, summary)
+                        st.session_state.current_question += 1
+                        st.rerun()
         else:
-            st.markdown("<div class='premium-card' style='background: rgba(52, 211, 153, 0.03); border-color: #34D399;'><h3>🎉 Interview completed successfully! Generating your in-depth evaluation results...</h3></div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='premium-card' style='background: rgba(52, 211, 153, 0.03); border-color: {_c_green};'><h3>🎉 Interview completed successfully! Generating your in-depth evaluation results...</h3></div>", unsafe_allow_html=True)
             progress_bar = st.progress(0)
             for percent_complete in range(100):
                 time.sleep(0.003)
                 progress_bar.progress(percent_complete + 1)
 
             st.markdown("<h2 class='gradient-text'>Final Report & Technical Performance Analysis</h2>", unsafe_allow_html=True)
+
+            answers = st.session_state.interview_answers
+            evals = st.session_state.interview_evaluations
+            scores = [e.get("final_score") for e in evals
+                      if isinstance(e.get("final_score"), (int, float))]
+            # Prefer the figure finalize_interview() computed from the stored
+            # answer rows, so the report shows exactly what was written. The
+            # session-state average is only a fallback for a report re-rendered
+            # after the write already happened.
+            overall = st.session_state.get("final_score")
+            if overall is None:
+                overall = round(100 * sum(scores) / len(scores)) if scores else 0
+
+            # Colour and label follow the same thresholds the agent routes on,
+            # so what the candidate reads matches what the system decided.
+            if overall >= 80:
+                colour, verdict = _c_green, "Ready for the real interview"
+            elif overall >= 40:
+                colour, verdict = _c_yellow, "Solid in places — see the weak skills below"
+            else:
+                colour, verdict = _c_red, "Needs preparation before interviewing"
+
             score_col1, score_col2 = st.columns([1, 2])
             with score_col1:
-                st.markdown("<div class='premium-card' style='text-align: center;'><h4>Overall Score</h4><h1 style='font-size: 4rem; color: #34D399;'>87%</h1><span class='badge'>Ready for the real interview</span></div>", unsafe_allow_html=True)
+                st.markdown(
+                    f"<div class='premium-card' style='text-align: center;'><h4>Overall Score</h4>"
+                    f"<h1 style='font-size: 4rem; color: {colour};'>{overall}%</h1>"
+                    f"<span class='badge'>{verdict}</span>"
+                    f"<p style='color:{_muted}; font-size:0.8rem; margin-top:8px;'>"
+                    f"mean of {len(scores)} evaluated answer(s)</p></div>",
+                    unsafe_allow_html=True,
+                )
             with score_col2:
-                st.markdown('<div class="premium-card"><h4>Skill Evaluation Breakdown:</h4><p><b>• Technical Answer Depth:</b> 9/10 - You showed excellent understanding of the engineering architecture and hardware/software integration.</p><p><b>• Structure (STAR Methodology):</b> 8/10 - Your answers were logically organized and methodical.</p></div>', unsafe_allow_html=True)
+                # Per-skill, worst first — the point of the report is what to
+                # go and fix, not a compliment.
+                by_skill = {}
+                # A skill counts as untested only when EVERY answer on it missed
+                # the topic. One off-topic answer among several still leaves
+                # evidence, so the average stands.
+                untested_skill = {}
+                for a in answers:
+                    if isinstance(a.get("score"), (int, float)):
+                        key = a.get("targets_skill") or "general"
+                        by_skill.setdefault(key, []).append(a["score"])
+                        untested_skill[key] = (untested_skill.get(key, True)
+                                               and bool(a.get("skill_untested")))
+                rows = sorted(((s, sum(v) / len(v)) for s, v in by_skill.items()),
+                              key=lambda x: x[1])
+                body = "".join(
+                    "<p><b>• {}:</b> {:.0f}% &nbsp;<span style='color:{};"
+                    "font-size:0.85rem;'>{}</span></p>".format(
+                        skill, avg * 100, *_skill_verdict(avg, untested_skill.get(skill, False)))
+                    for skill, avg in rows
+                ) or f"<p style='color:{_muted};'>No answers were evaluated.</p>"
+                st.markdown(
+                    f"<div class='premium-card'><h4>Skill Breakdown "
+                    f"<span style='color:{_muted}; font-size:0.8rem;'>(weakest first)</span></h4>"
+                    f"{body}</div>",
+                    unsafe_allow_html=True,
+                )
 
-            if st.session_state.interview_answers:
-                with st.expander(f"📝 Session transcript ({len(st.session_state.interview_answers)} answers saved)", expanded=False):
-                    for i, item in enumerate(st.session_state.interview_answers, start=1):
-                        st.markdown(f"**Q{i}. {item['question']}**")
-                        st.markdown(f"<span style='color:#9CA3AF;'>{item['answer'] or '(no answer given)'}</span>", unsafe_allow_html=True)
+            # --- what to work on next ------------------------------------
+            # The evaluator already wrote feedback on every answer, but it sat
+            # inside the collapsed transcript below: advice nobody opens is
+            # advice nobody reads. This lifts it out for the skills that did
+            # not reach the strong threshold, worst first, quoting the
+            # evaluator on the weakest answer for each skill rather than
+            # inventing generic study tips.
+            worst_answer = {}
+            for a in answers:
+                skill = a.get("targets_skill") or "general"
+                if not a.get("feedback") or not isinstance(a.get("score"), (int, float)):
+                    continue
+                if skill not in worst_answer or a["score"] < worst_answer[skill]["score"]:
+                    worst_answer[skill] = a
+            todo = [(skill, avg) for skill, avg in rows
+                    if avg <= ANSWER_STRONG_THRESHOLD and skill in worst_answer][:4]
+            if todo:
+                items = ""
+                for skill, avg in todo:
+                    colour, label = _skill_verdict(avg, untested_skill.get(skill, False))
+                    items += (
+                        f"<p style='margin:14px 0 4px;'><b>• {skill}</b> "
+                        f"<span style='color:{colour}; font-size:0.85rem;'>"
+                        f"{avg * 100:.0f}% {label}</span></p>"
+                        f"<p style='color:{_muted}; font-size:0.9rem; "
+                        f"margin:0 0 0 14px;'>{_rtl(worst_answer[skill]['feedback'])}</p>")
+                st.markdown(
+                    f"<div class='premium-card'><h4>🎯 What to work on next "
+                    f"<span style='color:{_muted}; font-size:0.8rem;'>"
+                    f"(the evaluator's own notes on your weakest answer per skill)"
+                    f"</span></h4>{items}</div>",
+                    unsafe_allow_html=True,
+                )
+            elif rows:
+                st.markdown(
+                    f"<div class='premium-card'><h4>🎯 What to work on next</h4>"
+                    f"<p style='color:{_muted};'>Every skill tested came out above "
+                    f"{ANSWER_STRONG_THRESHOLD * 100:.0f}% — nothing stood out as "
+                    f"needing work in this session.</p></div>",
+                    unsafe_allow_html=True,
+                )
+
+            if answers:
+                with st.expander(f"📝 Session transcript ({len(answers)} answers)", expanded=False):
+                    for i, item in enumerate(answers, start=1):
+                        score = item.get("score")
+                        score_txt = f" — {score * 100:.0f}%" if isinstance(score, (int, float)) else ""
+                        st.markdown(
+                            f"<b>Q{i}.</b>{score_txt}{_rtl(item['question'])}",
+                            unsafe_allow_html=True)
+                        # Rendered as Markdown, not escaped: the candidate may
+                        # have formatted the answer with the editor toolbar, and
+                        # showing raw ** and ` symbols in the report would make
+                        # a well-structured answer look worse than a plain one.
+                        answer_md = item["answer"] or "_(no answer given)_"
+                        if st.session_state.interview_language == "ar":
+                            st.markdown(f"<div class='rtl'>", unsafe_allow_html=True)
+                            st.markdown(answer_md)
+                            st.markdown("</div>", unsafe_allow_html=True)
+                        else:
+                            st.markdown(answer_md)
+                        if item.get("feedback"):
+                            st.markdown(f"💬 {_rtl(item['feedback'])}", unsafe_allow_html=True)
+
+                        ig = item.get("integrity") or {}
+                        if ig:
+                            icon = {"pasted": "🔴", "suspicious": "🟠",
+                                    "plausible": "🟢"}.get(ig["verdict"], "⚪")
+                            note = ""
+                            if ig["verdict"] == "pasted":
+                                note = " — faster than any human types; this answer was pasted"
+                            elif ig["verdict"] == "suspicious":
+                                note = " — unusually fast for composed writing"
+                            st.caption(
+                                f"{icon} {ig['seconds']}s · {ig['words']} words · "
+                                f"{ig['wpm']} wpm · left the tab {ig['focus_losses']}×{note}")
+                        if item.get("thought"):
+                            # The agent's written reasoning is what makes an
+                            # adaptive decision auditable instead of silent.
+                            st.markdown(
+                                f"<details><summary style='color:#7C3AED; cursor:pointer;'>"
+                                f"Why the interview went this way "
+                                f"(<code>{item.get('route')}</code>)</summary>"
+                                f"<p style='color:{_muted}; font-size:0.85rem;'>{item['thought'][:900]}</p>"
+                                f"</details>",
+                                unsafe_allow_html=True)
                         st.markdown("---")
 
-        
+
+            # The planned set, not the live queue: this panel reports on
+            # question *generation*, so it must show what the generator
+            # produced rather than what the agent later inserted or dropped.
+            generated = st.session_state.generated_questions
             if generated:
                 passed = sum(1 for q in generated if q.get("passes_gate"))
                 gap_qs = sum(1 for q in generated if q.get("is_gap_skill"))
@@ -854,7 +2264,7 @@ def render_interview():
                         st.markdown(
                             f"**Q{i}** — targets <b>{q['targets_skill']}</b> ({gap_label}) &nbsp;|&nbsp; "
                             f"AS = <b>{q['answerability_score']:.2f}</b> {gate_icon} "
-                            f"<span style='color:#9CA3AF; font-size:0.85rem;'>"
+                            f"<span style='color:{_muted}; font-size:0.85rem;'>"
                             f"(entities {entities_label} · clarity {q['context_clarity']:.2f} · specificity {q['task_specificity']:.2f})"
                             f"</span>",
                             unsafe_allow_html=True,
@@ -865,6 +2275,7 @@ def render_interview():
                 st.session_state.current_question = 0
                 st.session_state.current_interview_id = None
                 st.session_state.interview_answers = []
+                _reset_interview_state()
                 navigate_to("Dashboard")
 
 def render_billing():
@@ -874,7 +2285,8 @@ def render_billing():
 
 st.sidebar.markdown("<h2 class='gradient-text' style='text-align:center;'>IntervAI Pro 🤖</h2>", unsafe_allow_html=True)
 st.sidebar.toggle("🌙 Dark Mode", key="dark_mode")
-st.sidebar.markdown("<hr style='border-color: rgba(255,255,255,0.05);'>", unsafe_allow_html=True)
+st.sidebar.markdown(f"<hr style='border-color: {_hr};'>", unsafe_allow_html=True)
+render_db_badge()
 
 if not st.session_state.is_logged_in:
     available_pages = ["Home (Landing Page)", "Login Portal"]
@@ -883,7 +2295,7 @@ if not st.session_state.is_logged_in:
     nav_selection = st.sidebar.radio("Main Menu", available_pages, index=default_idx)
     st.session_state.page = "Landing" if nav_selection == "Home (Landing Page)" else "Auth"
 else:
-    st.sidebar.markdown(f"<p style='text-align:center; color:#A78BFA;'>👤 {st.session_state.user_name}</p>", unsafe_allow_html=True)
+    st.sidebar.markdown(f"<p style='text-align:center; color:{_c_violet};'>👤 {st.session_state.user_name}</p>", unsafe_allow_html=True)
     menu_options = {
         "📊 Dashboard": "Dashboard",
         "📂 Upload System": "Upload System",
@@ -901,7 +2313,7 @@ else:
     selection = st.sidebar.radio("Cloud Navigation Panel", list_keys, index=default_idx)
     st.session_state.page = menu_options[selection]
 
-    st.sidebar.markdown("<hr style='border-color: rgba(255,255,255,0.05);'>", unsafe_allow_html=True)
+    st.sidebar.markdown(f"<hr style='border-color: {_hr};'>", unsafe_allow_html=True)
     if st.sidebar.button("Log Out"):
         st.session_state.is_logged_in = False
         st.session_state.user_id = None
